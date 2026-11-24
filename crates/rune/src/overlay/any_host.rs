@@ -65,9 +65,20 @@ impl OverlayCore {
     }
 
     /// Answers what assistive clients asked of the overlay and sends its tree's changes. An
-    /// action draws the frame that runs it.
+    /// action draws the frame that runs it. A hidden overlay leaves the accessibility bus where
+    /// the platform would list it (`a11y::Listing`), and joins it again as it shows.
     fn a11y_turn(&mut self, rt: &mut RuntimeCore) -> bool {
-        let Some(adapter) = self.surface.live_mut().and_then(|l| l.a11y.as_mut()) else { return false };
+        let shown = self.presence.shown();
+        let Some(live) = self.surface.live_mut() else { return false };
+        match crate::a11y::listing(crate::a11y::HIDDEN_LEAVES, shown, live.a11y.is_some()) {
+            crate::a11y::Listing::Join => live.a11y = self.shared.wake.lock().unwrap().clone().and_then(crate::a11y::Adapter::windowless),
+            crate::a11y::Listing::Leave => {
+                live.a11y = None;
+                rt.a11y_deactivate();
+            }
+            crate::a11y::Listing::Keep => {}
+        }
+        let Some(adapter) = live.a11y.as_mut() else { return false };
         let queued = adapter.service_core(rt, a11y_name(&self.accessible_name, self.name));
         if queued {
             self.dirty = true;

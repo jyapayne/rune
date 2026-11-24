@@ -17,6 +17,8 @@ mod actions_tests;
 pub(crate) mod dump;
 #[cfg(test)]
 mod dump_tests;
+#[cfg(test)]
+mod listing_tests;
 mod node;
 pub(crate) mod roles;
 #[cfg(test)]
@@ -215,6 +217,33 @@ impl AccessibilityLink {
         let update = rt.a11y_update()?;
         if let Some(t) = started { eprintln!("rune: a11y update: {} nodes in {:.0} us", update.nodes.len(), t.elapsed().as_secs_f64() * 1e6); }
         Some(update)
+    }
+}
+
+/// What an overlay's adapter does as the overlay shows and hides. AT-SPI lists every adapter
+/// as one of the app's windows, shown or not, so on Linux a hidden overlay takes its adapter
+/// off the bus (a prewarmed launcher's results would otherwise read as if on screen), and a
+/// shown one puts a new one on, whose client reads the whole tree again. Windows and macOS keep
+/// theirs: a hidden window or an ordered-out panel is already out of the platform's tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Keep,
+    /// Make an adapter: the overlay shows and has none.
+    Join,
+    /// Drop the adapter and the tree it fed: the overlay hid.
+    Leave,
+}
+
+/// Whether a hidden overlay leaves the accessibility bus (`Listing`).
+pub(crate) const HIDDEN_LEAVES: bool = cfg!(all(feature = "accessibility", target_os = "linux"));
+
+/// What an overlay's adapter does on this turn: `shown`, the overlay is shown; `listed`, it
+/// has an adapter; `hidden_leaves`, the platform lists hidden surfaces (`HIDDEN_LEAVES`).
+pub(crate) fn listing(hidden_leaves: bool, shown: bool, listed: bool) -> Listing {
+    match (hidden_leaves, shown, listed) {
+        (true, true, false) => Listing::Join,
+        (true, false, true) => Listing::Leave,
+        _ => Listing::Keep,
     }
 }
 

@@ -1,0 +1,1 @@
+- On Linux a hidden overlay is no longer listed to screen readers: its AT-SPI window goes as it hides and comes back, read whole again, as it shows. A prewarmed overlay (a launcher kept ready) used to list its whole tree while off screen.
