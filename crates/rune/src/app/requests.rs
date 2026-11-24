@@ -99,6 +99,8 @@ pub(crate) struct SharedCore {
     /// `AppHandle::quit` was called, or the web app is ending.
     pub(crate) quitting: AtomicBool,
     pub(crate) window_error: Mutex<Option<String>>,
+    /// Overlays `AppHandle::add_overlay` asked for, until the event loop builds them.
+    overlays: Mutex<Vec<crate::overlay::Deferred>>,
 }
 
 impl SharedCore {
@@ -209,6 +211,16 @@ impl SharedCore {
 
     pub(crate) fn take_place(&self) -> Option<crate::windows::PlaceRequest> {
         self.requests.lock().unwrap().place.take()
+    }
+
+    /// Queues an overlay for the event loop to build, and wakes it.
+    pub(crate) fn add_overlay(&self, make: crate::overlay::Deferred) {
+        self.overlays.lock().unwrap().push(make);
+        self.wake();
+    }
+
+    pub(crate) fn take_overlays(&self) -> Vec<crate::overlay::Deferred> {
+        std::mem::take(&mut self.overlays.lock().unwrap())
     }
 }
 

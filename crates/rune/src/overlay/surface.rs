@@ -409,6 +409,8 @@ impl Drop for OverlayCore {
     fn drop(&mut self) {
         *self.shared.native.lock().unwrap() = Default::default();
         self.set_availability(Availability::Unavailable);
+        // Its slot in the event loop goes with it: nothing is left to wake.
+        self.shared.wake.lock().unwrap().take();
         self.release();
         // Drop the renderer before polling a shared device so finished work retires its
         // textures and buffers now without waiting on the UI thread.

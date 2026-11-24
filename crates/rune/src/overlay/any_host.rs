@@ -141,6 +141,8 @@ impl AnyHost for OverlayHost {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
         self.core.meter.waited();
+        // `OverlayHandle::remove`: off the screen now; the loop drops the host as this turn ends.
+        if self.core.shared.removed() { return self.core.hide(&mut *self.app); }
         #[cfg(target_os = "windows")]
         if matches!(event, WakeEvent::FrameSlot(_)) {
             // The frame that waited for room in the swap chain draws now, after what changed
@@ -430,6 +432,10 @@ impl AnyHost for OverlayHost {
     fn keeps_loop(&self) -> bool {
         false
     }
+
+    /// Removed through its handle, and off the screen: `user_event` hides it on the wake the
+    /// removal sends, before the loop drops it.
+    fn finished(&self) -> bool { self.core.shared.removed() && !self.core.presence.drawing() }
 
     fn cancel_menus(&mut self) { self.app.popup_cancel(&mut self.core.popup); }
 }

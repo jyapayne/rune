@@ -257,3 +257,25 @@ fn multi_monitor_native_bounds_are_contiguous() {
     assert_eq!((cx + cw).round(), rx);
     assert_eq!((rw.round(), rh.round()), (797.0, 1469.0));
 }
+
+#[test]
+fn a_watched_output_is_listed_once_described_with_its_logical_geometry() {
+    use super::WatchedOutput;
+    let mut output = WatchedOutput::default();
+    assert!(!output.ready(false) && !output.ready(true), "a bound output with no event yet isn't listed");
+
+    // `wl_output` described it (`done`); its `zxdg_output_v1` hasn't answered yet.
+    output.raw.mode = Some((2560, 1440));
+    output.raw.integer_scale = Some(2);
+    output.name = Some("DP-2".into());
+    output.described = true;
+    assert!(output.ready(false), "without zxdg_output_manager_v1 that is all there is");
+    assert!(!output.ready(true), "with it, a scale read without the logical size would be the integer one");
+
+    output.raw.logical_position = Some((1920, 0));
+    output.raw.logical_size = Some((1707, 960));
+    assert!(output.ready(true));
+    let resolved = resolve(Some(&output.raw), ResolvedOutput { position: (3840, 0), size: (2560, 1440), scale: 2.0 });
+    assert_eq!(resolved.position, (1920, 0));
+    assert!((resolved.scale - 1.5).abs() < 0.001, "{}", resolved.scale);
+}

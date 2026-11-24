@@ -28,6 +28,7 @@ use crate::tooling::Chrome;
 
 mod app_events;
 mod chrome;
+mod displays;
 mod event_loop;
 mod file_drop;
 mod handle;
@@ -235,6 +236,8 @@ struct Windows {
     display_error: Option<String>,
     /// Scheduling state for waking winit on Wayland display reads and draining mid-turn layer events.
     wayland_wake: wayland_wake::State,
+    /// `App::on_displays_changed` handlers, and the overlays apps add while they run.
+    displays: displays::Displays,
 }
 impl Windows {
     /// Starts the windows `crate::open_window` asked for this turn, in fresh slots, each like
@@ -253,12 +256,13 @@ impl Windows {
                 }
                 let mut args = self.args.clone();
                 (args.scene, args.size) = (None, None);
-                let mut overlays = Vec::new();
+                let (mut overlays, mut links) = (Vec::new(), Vec::new());
                 let slot = self.hosts.len();
-                let host = spec.start(args, Start { proxy: self.proxy.clone(), slot, gpu: self.gpu.clone(), wayland, traced: false, overlays: &mut overlays });
+                let host = spec.start(args, Start { proxy: self.proxy.clone(), slot, gpu: self.gpu.clone(), wayland, traced: false, overlays: &mut overlays, links: &mut links });
                 self.hosts.push(host);
                 if let Some(Some(host)) = self.hosts.get_mut(slot) { host.resumed(event_loop); }
                 self.connect_overlays(overlays, event_loop);
+                self.displays.link(links);
             }
         }
     }
@@ -276,6 +280,14 @@ impl Windows {
         }
     }
 
+    /// Tells the displays handlers what they haven't heard, and connects the overlays they add
+    /// like the ones their apps started with.
+    fn displays_turn(&mut self, event_loop: &ActiveEventLoop) {
+        if event_loop.exiting() { return; }
+        let added = self.displays.turn(event_loop);
+        self.connect_overlays(added, event_loop);
+    }
+
     fn cleanup(&mut self, event_loop: &ActiveEventLoop) {
         if !event_loop.exiting() { self.open_requested(event_loop); }
         let _ = collect_startup_errors(&mut self.hosts, &mut self.any_shown, &mut self.startup_error);
@@ -286,6 +298,7 @@ impl Windows {
         let fast_exit = false;
         let exiting = event_loop.exiting();
         let should_exit = app_events::cleanup_hosts(&mut self.hosts, !exiting && ok, fast_exit, crate::quit::send);
+        self.displays.prune(&self.hosts);
         // Another window's quit: a menu still tracking would hold the loop open.
         if exiting || should_exit {
             for host in self.hosts.iter_mut().flatten() { host.cancel_menus(); }
@@ -325,6 +338,8 @@ pub(crate) struct Start<'a> {
     /// Whether this window records `--native` traces.
     traced: bool,
     overlays: &'a mut Vec<Box<dyn crate::overlay::PendingOverlay>>,
+    /// Each started app's link for the overlays added while it runs, with its host's slot.
+    links: &'a mut Vec<(usize, crate::overlay::AppLink)>,
 }
 
 impl Start<'_> {
@@ -364,46 +379,19 @@ impl ApplicationHandler<WakeEvent> for Windows {
         let Some(factory) = self.factory.take() else { return };
         crate::marks::mark("loop.resumed");
         let wayland = is_wayland(event_loop);
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        let wayland_outputs = wayland
-            .then(|| winit::raw_window_handle::HasDisplayHandle::display_handle(event_loop).ok())
-            .flatten()
-            .map(|display| crate::platform::wayland_output::query(display.as_raw()))
-            .unwrap_or_default();
-        let primary = event_loop.primary_monitor();
-        let displays: Vec<_> = event_loop.available_monitors().map(|m| {
-            let id = crate::DisplayId::from_monitor(m.clone(), wayland);
-            let fallback = ((m.position().x, m.position().y), (m.size().width, m.size().height), m.scale_factor());
-            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-            let (position, size, scale) = match id.native_id() {
-                Some(crate::NativeDisplayId::Wayland(output_id)) => {
-                    let resolved = crate::platform::wayland_output::resolve(
-                        wayland_outputs.get(&output_id),
-                        crate::platform::wayland_output::ResolvedOutput {
-                            position: fallback.0,
-                            size: fallback.1,
-                            scale: fallback.2,
-                        },
-                    );
-                    (resolved.position, resolved.size, resolved.scale)
-                }
-                _ => fallback,
-            };
-            #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
-            let (position, size, scale) = fallback;
-            Display {
-                id: Some(id), name: m.name(), position, size, scale, primary: primary.as_ref() == Some(&m),
-            }
-        }).collect();
+        let (displays, outputs) = displays::at_launch(event_loop, wayland);
         let specs = crate::windows::flatten(factory(&displays));
         crate::windows::validate(&specs).expect("window keys");
         let trace_window = self.args.window.clone().or_else(|| specs.first().map(|s| s.key().to_owned()));
-        let mut overlays = Vec::new();
+        let (mut overlays, mut links) = (Vec::new(), Vec::new());
         self.hosts = start_all(specs, |slot, spec| {
             let traced = trace_window.as_deref() == Some(spec.key());
-            spec.start(self.args.clone(), Start { proxy: self.proxy.clone(), slot, gpu: self.gpu.clone(), wayland, traced, overlays: &mut overlays })
+            spec.start(self.args.clone(), Start { proxy: self.proxy.clone(), slot, gpu: self.gpu.clone(), wayland, traced, overlays: &mut overlays, links: &mut links })
         }, |host| host.resumed(event_loop));
         self.connect_overlays(overlays, event_loop);
+        self.displays.link(links);
+        self.displays.launched(outputs);
+        self.displays_turn(event_loop);
         // A launch with no window makes its menu bar now; a window's first frame made it.
         #[cfg(target_os = "macos")]
         crate::native_menu::bar_ready();
@@ -448,8 +436,14 @@ impl ApplicationHandler<WakeEvent> for Windows {
                 return;
             }
         };
+        // `AppHandle::add_overlay` woke its app's host: the overlays it asked for start now.
+        let app = matches!(event, WakeEvent::App(_));
         if let Some(Some(host)) = self.hosts.get_mut(slot) {
             host.user_event(event_loop, event);
+        }
+        if app {
+            let added = self.displays.take_added(slot);
+            self.connect_overlays(added, event_loop);
         }
         self.cleanup(event_loop);
     }
@@ -487,6 +481,8 @@ impl ApplicationHandler<WakeEvent> for Windows {
         #[cfg(target_os = "macos")]
         crate::platform::macos::launch::settle();
         crate::cursor::os::make_pending(event_loop);
+        // Before the hosts draw, so an overlay added for a new display draws this turn.
+        self.displays_turn(event_loop);
         let mut animating = false;
         for host in self.hosts.iter_mut().flatten() {
             animating |= host.about_to_wait(event_loop);
@@ -495,7 +491,7 @@ impl ApplicationHandler<WakeEvent> for Windows {
         // putting off behind another window's.
         let now = crate::time::now();
         for host in self.hosts.iter_mut().flatten() { host.turn_ends(event_loop, now); }
-        let effects = wayland_wake::about_to_wait(&mut self.wayland_wake, &self.hosts);
+        let effects = wayland_wake::about_to_wait(&mut self.wayland_wake, &self.hosts, self.displays.watching(), self.displays.pending());
         self.apply_wayland_wake(event_loop, effects);
         // Layer surfaces have no redraw events: keep turning while one animates (its vsync
         // paces the loop). Hosts whose only motion is an ambient loop sleep until its next step.
@@ -535,6 +531,8 @@ impl ApplicationHandler<WakeEvent> for Windows {
         }
         let effects = wayland_wake::step(&mut self.wayland_wake, wayland_wake::Event::Exiting);
         self.apply_wayland_wake(event_loop, effects);
+        // The output watcher lives on winit's display connection too.
+        self.displays.close();
         // Surfaces go while winit's display connection is still open (layer surfaces live on it).
         self.hosts.clear();
         crate::marks::mark("windows.dropped");

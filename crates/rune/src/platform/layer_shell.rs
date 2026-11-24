@@ -967,6 +967,11 @@ impl LayerSurface {
         !self.state.readiness.closed()
     }
 
+    /// Whether the surface was made on the output asked for, rather than left to the compositor.
+    pub fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
     /// True when the surface is still live and libwayland's private event queue already holds
     /// unread events (for example from a mid-turn `wl_display` read during swapchain acquire,
     /// present, or a roundtrip). Checks the queue in memory without syscalls by immediately

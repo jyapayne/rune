@@ -71,6 +71,7 @@ pub struct App<S: 'static> {
     pub(crate) on_open_url: Option<crate::open_url::incoming::OnOpenUrl<S>>,
     pub(crate) shared: Arc<Shared<S>>,
     pub(crate) overlays: Vec<Box<dyn crate::overlay::PendingOverlay>>,
+    pub(crate) on_displays: Option<crate::overlay::OnDisplays>,
     pub(crate) windows: Vec<crate::AnyWindowSpec>,
     pub(crate) on_window: Option<OnWindow>,
     pub(crate) on_ready: Option<OnWindow>,
@@ -131,6 +132,7 @@ impl<S: 'static> App<S> {
             on_open_url: None,
             shared,
             overlays: Vec::new(),
+            on_displays: None,
             windows: Vec::new(),
             on_window: None,
             on_ready: None,
@@ -328,17 +330,6 @@ impl<S: 'static> App<S> {
     pub fn on_ime(mut self, f: fn(&mut S, &crate::Ime, &mut Tx) -> bool) -> Self {
         self.runtime.on_ime = Some(f);
         self
-    }
-
-    /// Adds a transparent overlay with its own state, hidden until `OverlayHandle::show`.
-    /// Bare specs preserve primary-display edge placement and never request key focus;
-    /// `OverlaySpec::options` selects displays, placement and native input policy.
-    /// Uses this app's fonts and font smoothing (`ConfiguredOverlay::font_smoothing` overrides it).
-    /// Headless runs don't draw overlays.
-    pub fn overlay<T: 'static>(&mut self, spec: impl Into<crate::ConfiguredOverlay<T>>, state: T) -> crate::overlay::OverlayHandle<T> {
-        let (overlay, handle) = crate::overlay::OverlayHost::new(spec.into(), state, &self.spec, self.runtime.font_smoothing);
-        self.overlays.push(Box::new(overlay));
-        handle
     }
 
     /// Adds an ordinary window with its own state type to this app's event loop, such as a
@@ -801,6 +792,7 @@ impl<S: 'static> AppHandle<S> {
 }
 
 mod config;
+mod overlays;
 pub(crate) use config::RuntimeConfig;
 mod requests;
 pub(crate) use requests::{window_request_order, Activation, Shared, SharedCore, WindowRequest, WindowRequests};

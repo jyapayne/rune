@@ -58,7 +58,7 @@ impl FrameHost for OverlayFrame<'_> {
         if let Some(Live { backing: Backing::Layer(layer), .. }) = self.core.surface.live_mut() {
             let changes = layer.dispatch();
             if changes.closed {
-                self.core.hide(self.app);
+                self.core.surface_closed(self.app);
                 return Gate::Skip;
             }
             for input in changes.input { self.core.surface_input(self.app, input); }
@@ -486,7 +486,7 @@ impl OverlayCore {
                 }
                 _ => false,
             };
-            if closed { self.hide(app); }
+            if closed { self.surface_closed(app); }
         }
         #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
         let _ = app;

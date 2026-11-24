@@ -2,10 +2,12 @@
 //!
 //! winit 0.30 builds `MonitorHandle` from untransformed `wl_output.mode`, integer `wl_output.scale`,
 //! and `logical_position * integer_scale`. On fractional-scale or 90/270-degree rotated outputs,
-//! those values contradict `Display::native_bounds()`. Querying `wl_output` and `zxdg_output_v1`
-//! in one roundtrip on a private queue recovers rotated physical dimensions, compositor logical
-//! origin, and fractional scale, falling back to winit's values when `zxdg_output_manager_v1` is
-//! unavailable.
+//! those values contradict `Display::native_bounds()`. Asking `wl_output` and `zxdg_output_v1`
+//! on a private queue (`Watcher`, one roundtrip) recovers rotated physical dimensions, compositor
+//! logical origin, and fractional scale, falling back to winit's values when
+//! `zxdg_output_manager_v1` is unavailable. Kept, the watcher follows outputs as they are
+//! plugged in, unplugged and reconfigured, which winit tracks without saying so
+//! (`window::displays`, for `App::on_displays_changed`).
 
 /// Rotation/reflection advertised by `wl_output.geometry`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,6 +115,26 @@ pub(crate) fn resolve(raw: Option<&RawOutput>, fallback: ResolvedOutput) -> Reso
     ResolvedOutput { position, size, scale }
 }
 
+/// One output as [`Watcher`] knows it between events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WatchedOutput {
+    pub raw: RawOutput,
+    /// The connector name (`DP-2`): `wl_output.name` (v4), or `zxdg_output_v1.name` from a
+    /// compositor whose `wl_output` is older.
+    pub name: Option<String>,
+    /// The compositor has finished describing it at least once (`wl_output.done`; a version 1
+    /// output never says so, and counts from its first event).
+    pub described: bool,
+}
+
+impl WatchedOutput {
+    /// Whether it can be listed: described, with its logical geometry too where the compositor
+    /// has `zxdg_output_manager_v1` (`logical`), so a new output isn't listed half known.
+    pub(crate) fn ready(&self, logical: bool) -> bool {
+        self.described && (!logical || self.raw.logical_size.is_some())
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
 mod wayland {
     use std::collections::HashMap;
@@ -121,29 +143,80 @@ mod wayland {
     use wayland_backend::client::Backend;
     use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
     use wayland_client::protocol::wl_output::{self, WlOutput};
-    use wayland_client::protocol::wl_registry::WlRegistry;
+    use wayland_client::protocol::wl_registry::{self, WlRegistry};
     use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum};
     use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::{
         self, ZxdgOutputManagerV1,
     };
     use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{self, ZxdgOutputV1};
 
-    use super::{OutputTransform, RawOutput};
+    use super::{OutputTransform, RawOutput, WatchedOutput};
+
+    /// A `wl_output` global the watcher bound, with its `zxdg_output_v1` where there is one.
+    struct Bound {
+        info: WatchedOutput,
+        wl: WlOutput,
+        xdg: Option<ZxdgOutputV1>,
+    }
+
+    impl Bound {
+        fn release(self) {
+            if let Some(xdg) = self.xdg {
+                xdg.destroy();
+            }
+            if self.wl.version() >= 3 {
+                self.wl.release();
+            } else if let Some(backend) = self.wl.backend().upgrade() {
+                backend.destroy_object(&self.wl.id()).ok();
+            }
+        }
+    }
 
     #[derive(Default)]
     struct State {
-        outputs: HashMap<u32, RawOutput>,
+        /// Keyed by registry global name (`NativeDisplayId::Wayland`).
+        outputs: HashMap<u32, Bound>,
+        manager: Option<ZxdgOutputManagerV1>,
+        /// An output came, went or was described anew since `Watcher::dispatch` last said so.
+        changed: bool,
+    }
+
+    impl State {
+        fn bind(&mut self, registry: &WlRegistry, name: u32, version: u32, qh: &QueueHandle<Self>) {
+            // Events still queued when the watcher goes are drained after its registry.
+            if !registry.is_alive() {
+                return;
+            }
+            let wl = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, name);
+            let xdg = self.manager.as_ref().map(|manager| manager.get_xdg_output(&wl, qh, name));
+            // A global announced while the list was read is bound from the list and again here.
+            if let Some(twice) = self.outputs.insert(name, Bound { info: WatchedOutput::default(), wl, xdg }) {
+                twice.release();
+            }
+        }
     }
 
     impl Dispatch<WlRegistry, GlobalListContents> for State {
         fn event(
-            _: &mut Self,
-            _: &WlRegistry,
-            _: <WlRegistry as Proxy>::Event,
+            state: &mut Self,
+            registry: &WlRegistry,
+            event: wl_registry::Event,
             _: &GlobalListContents,
             _: &Connection,
-            _: &QueueHandle<Self>,
+            qh: &QueueHandle<Self>,
         ) {
+            match event {
+                wl_registry::Event::Global { name, interface, version } if interface == "wl_output" => {
+                    state.bind(registry, name, version, qh);
+                }
+                wl_registry::Event::GlobalRemove { name } => {
+                    if let Some(gone) = state.outputs.remove(&name) {
+                        gone.release();
+                        state.changed = true;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -162,17 +235,19 @@ mod wayland {
     impl Dispatch<WlOutput, u32> for State {
         fn event(
             state: &mut Self,
-            _: &WlOutput,
+            output: &WlOutput,
             event: wl_output::Event,
             &global_name: &u32,
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            let entry = state.outputs.entry(global_name).or_default();
+            // A removed output's last events change nothing.
+            let Some(bound) = state.outputs.get_mut(&global_name) else { return };
+            let entry = &mut bound.info;
             match event {
                 wl_output::Event::Geometry { x, y, transform, .. } => {
-                    entry.geometry_position = Some((x, y));
-                    entry.transform = map_transform(transform);
+                    entry.raw.geometry_position = Some((x, y));
+                    entry.raw.transform = map_transform(transform);
                 }
                 wl_output::Event::Mode { flags, width, height, .. } => {
                     let is_current = match flags {
@@ -180,13 +255,25 @@ mod wayland {
                         WEnum::Unknown(raw) => (raw & wl_output::Mode::Current.bits()) != 0,
                     };
                     if is_current {
-                        entry.mode = Some((width, height));
+                        entry.raw.mode = Some((width, height));
                     }
                 }
                 wl_output::Event::Scale { factor } => {
-                    entry.integer_scale = Some(factor);
+                    entry.raw.integer_scale = Some(factor);
+                }
+                wl_output::Event::Name { name } => {
+                    entry.name = Some(name);
+                }
+                wl_output::Event::Done => {
+                    entry.described = true;
+                    state.changed = true;
                 }
                 _ => {}
+            }
+            // Version 1 has no `done`: each event stands alone.
+            if output.version() < 2 {
+                entry.described = true;
+                state.changed = true;
             }
         }
     }
@@ -200,13 +287,23 @@ mod wayland {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            let entry = state.outputs.entry(global_name).or_default();
+            let Some(bound) = state.outputs.get_mut(&global_name) else { return };
+            let entry = &mut bound.info;
             match event {
                 zxdg_output_v1::Event::LogicalPosition { x, y } => {
-                    entry.logical_position = Some((x, y));
+                    entry.raw.logical_position = Some((x, y));
                 }
                 zxdg_output_v1::Event::LogicalSize { width, height } => {
-                    entry.logical_size = Some((width, height));
+                    entry.raw.logical_size = Some((width, height));
+                }
+                zxdg_output_v1::Event::Name { name } => {
+                    if entry.name.is_none() {
+                        entry.name = Some(name);
+                    }
+                }
+                // Before version 3; later ones end a change with `wl_output.done`.
+                zxdg_output_v1::Event::Done => {
+                    state.changed = true;
                 }
                 _ => {}
             }
@@ -233,89 +330,127 @@ mod wayland {
         conn.backend().destroy_object(&registry_id).ok();
     }
 
-    fn drain_event_queue(queue: &mut EventQueue<State>, state: &mut State) {
+    /// Dispatches what the queue holds; how many events that was.
+    fn drain_event_queue(queue: &mut EventQueue<State>, state: &mut State) -> usize {
+        let mut handled = 0;
         loop {
             match queue.dispatch_pending(state) {
                 Ok(0) => break,
-                Ok(_) | Err(DispatchError::BadMessage { .. }) => {}
+                Ok(n) => handled += n,
+                Err(DispatchError::BadMessage { .. }) => {}
                 Err(_) => break,
             }
         }
+        handled
     }
 
-    /// Queries every `wl_output` global's mode, transform, integer scale, and `zxdg_output_v1`
-    /// logical geometry in one roundtrip on a private queue, keyed by registry global name
-    /// (`NativeDisplayId::Wayland`). Returns an empty map off Wayland or when
-    /// `zxdg_output_manager_v1` is unavailable so callers keep winit's values.
-    #[allow(unsafe_code)]
-    pub(crate) fn query(display: RawDisplayHandle) -> HashMap<u32, RawOutput> {
-        let RawDisplayHandle::Wayland(display) = display else {
-            return HashMap::new();
-        };
-        // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
-        // this synchronous query; a foreign backend never closes it.
-        let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
-        let conn = Connection::from_backend(backend);
-        let Ok((globals, mut queue)) = registry_queue_init::<State>(&conn) else {
-            return HashMap::new();
-        };
-        let qh = queue.handle();
-        let Ok(manager) = globals.bind::<ZxdgOutputManagerV1, _, _>(&qh, 1..=3, ()) else {
-            destroy_globals(&conn, globals);
-            drain_event_queue(&mut queue, &mut State::default());
-            queue.flush().ok();
-            return HashMap::new();
-        };
+    /// Every `wl_output` global's mode, transform, integer scale, name and `zxdg_output_v1`
+    /// logical geometry, on a private queue of winit's display connection, keyed by registry
+    /// global name (`NativeDisplayId::Wayland`). Making it asks once and waits for the answer
+    /// (one roundtrip); kept, it follows outputs as they come, go and change. winit reads the
+    /// socket, and `dispatch` handles what that read queued here.
+    pub(crate) struct Watcher {
+        conn: Connection,
+        globals: Option<GlobalList>,
+        queue: EventQueue<State>,
+        state: State,
+    }
 
-        let wl_outputs: Vec<(u32, WlOutput)> = globals.contents().with_list(|list| {
-            list.iter()
-                .filter(|g| g.interface == "wl_output")
-                .map(|g| {
-                    let output = globals.registry().bind::<WlOutput, _, _>(
-                        g.name,
-                        g.version.min(4),
-                        &qh,
-                        g.name,
-                    );
-                    (g.name, output)
-                })
-                .collect()
-        });
-
-        let xdg_outputs: Vec<ZxdgOutputV1> = wl_outputs
-            .iter()
-            .map(|(name, output)| manager.get_xdg_output(output, &qh, *name))
-            .collect();
-
-        let mut state = State::default();
-        let ok = if wl_outputs.is_empty() {
-            true
-        } else {
-            queue.roundtrip(&mut state).is_ok()
-        };
-
-        // Destroy every temporary proxy and drain pending events so the private queue is freed.
-        for xdg_output in xdg_outputs {
-            xdg_output.destroy();
-        }
-        manager.destroy();
-        for (_, wl_output) in wl_outputs {
-            if wl_output.version() >= 3 {
-                wl_output.release();
-            } else {
-                conn.backend().destroy_object(&wl_output.id()).ok();
+    impl Watcher {
+        /// None off Wayland, or when the display connection fails.
+        #[allow(unsafe_code)]
+        pub(crate) fn new(display: RawDisplayHandle) -> Option<Watcher> {
+            let RawDisplayHandle::Wayland(display) = display else {
+                return None;
+            };
+            // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
+            // the watcher (`Windows::exiting` drops it); a foreign backend never closes it.
+            let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
+            let conn = Connection::from_backend(backend);
+            let (globals, queue) = registry_queue_init::<State>(&conn).ok()?;
+            let qh = queue.handle();
+            let manager = globals.bind::<ZxdgOutputManagerV1, _, _>(&qh, 1..=3, ()).ok();
+            let listed: Vec<(u32, u32)> = globals.contents().with_list(|list| {
+                list.iter().filter(|g| g.interface == "wl_output").map(|g| (g.name, g.version)).collect()
+            });
+            let mut state = State { manager, ..State::default() };
+            for (name, version) in listed {
+                state.bind(globals.registry(), name, version, &qh);
             }
+            // From here `Drop` destroys every proxy and frees the queue, also when the answer
+            // never comes.
+            let mut watcher = Watcher { conn, globals: Some(globals), queue, state };
+            if !watcher.state.outputs.is_empty() {
+                watcher.queue.roundtrip(&mut watcher.state).ok()?;
+            }
+            Some(watcher)
         }
-        destroy_globals(&conn, globals);
-        drain_event_queue(&mut queue, &mut state);
-        queue.flush().ok();
 
-        if ok { state.outputs } else { HashMap::new() }
+        /// Handles what the compositor sent since the last call. True when an output came, went
+        /// or was described anew.
+        pub(crate) fn dispatch(&mut self) -> bool {
+            // A new output's binds go out now rather than with winit's next flush.
+            if drain_event_queue(&mut self.queue, &mut self.state) > 0 {
+                self.queue.flush().ok();
+            }
+            std::mem::take(&mut self.state.changed)
+        }
+
+        /// Whether a read this turn (a swapchain acquire, a roundtrip) already queued events
+        /// here; checked in memory, as `LayerSurface::has_pending_events` does.
+        pub(crate) fn has_pending_events(&self) -> bool {
+            self.queue.prepare_read().is_none()
+        }
+
+        /// Whether outputs carry compositor logical geometry (`zxdg_output_manager_v1`).
+        /// Without it callers keep winit's position, size and scale.
+        pub(crate) fn logical(&self) -> bool {
+            self.state.manager.is_some()
+        }
+
+        /// The output with this registry name, once the compositor has described it.
+        pub(crate) fn output(&self, name: u32) -> Option<&WatchedOutput> {
+            let logical = self.logical();
+            self.state.outputs.get(&name).map(|bound| &bound.info).filter(|output| output.ready(logical))
+        }
+
+        /// The registry names of the outputs the compositor has described.
+        pub(crate) fn described(&self) -> impl Iterator<Item = u32> + '_ {
+            let logical = self.logical();
+            self.state.outputs.iter().filter(move |(_, bound)| bound.info.ready(logical)).map(|(name, _)| *name)
+        }
+
+        /// What the roundtrip that made the watcher learned of each output, for the launch's
+        /// display list. Empty when `zxdg_output_manager_v1` is unavailable, so callers keep
+        /// winit's values.
+        pub(crate) fn queried(&self) -> HashMap<u32, RawOutput> {
+            if !self.logical() {
+                return HashMap::new();
+            }
+            self.state.outputs.iter().map(|(name, bound)| (*name, bound.info.raw)).collect()
+        }
+    }
+
+    impl Drop for Watcher {
+        /// Destroys every proxy and drains what is queued, so the private queue is freed.
+        fn drop(&mut self) {
+            for (_, bound) in self.state.outputs.drain() {
+                bound.release();
+            }
+            if let Some(manager) = self.state.manager.take() {
+                manager.destroy();
+            }
+            if let Some(globals) = self.globals.take() {
+                destroy_globals(&self.conn, globals);
+            }
+            drain_event_queue(&mut self.queue, &mut self.state);
+            self.queue.flush().ok();
+        }
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-pub(crate) use wayland::query;
+pub(crate) use wayland::Watcher;
 
 #[cfg(test)]
 #[path = "wayland_output_tests.rs"]
