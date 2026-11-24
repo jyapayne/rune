@@ -98,7 +98,8 @@ pub(crate) mod keyboard {
         KeyboardGone,
         /// The compositor cleared the surface's focus grab: the user pressed outside it.
         GrabCleared,
-        /// A show's first buffer mapped the surface.
+        /// A show's first buffer mapped the surface, or a mapped one asked for every key again
+        /// (`LayerSurface::set_keys`).
         Mapped,
     }
 

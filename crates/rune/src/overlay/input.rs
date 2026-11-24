@@ -422,6 +422,39 @@ impl OverlayCore {
         if moving { crate::Pacing::Vsync } else { crate::Pacing::Idle }
     }
 
+    /// `OverlayHandle::set_keys`. A shown overlay whose new policy takes no keys releases what
+    /// keys held and its input method, as a hide does; the blur comes from the compositor or the
+    /// window system. A layer surface asks for the new interactivity at once when shown, and an
+    /// X11 window focuses itself by the new policy; other windows keep their activation style.
+    fn set_keys(&mut self, app: &mut dyn OverlayApp, keys: crate::KeyPolicy) {
+        let was = std::mem::replace(&mut self.options.keys, keys);
+        if was == keys { return; }
+        let shown = self.presence.shown();
+        let released = shown && was.takes_keys() && !keys.takes_keys();
+        if released {
+            app.rt_mut().keys_lost();
+            self.mods = Default::default();
+            self.ime.clear();
+        }
+        match self.surface.backing_mut() {
+            Some(Backing::Window(window)) if released => {
+                crate::platform::ime::cancel(window);
+                window.set_ime_allowed(false);
+            }
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            Some(Backing::Layer(layer)) => {
+                if let Some(ime) = layer.set_keys(keys, shown) { crate::input::host_events::ime_core(app.rt_mut(), None, ime); }
+                self.shared.native.lock().unwrap().1.nonactivating_keys = if layer.supports_keys() { OverlaySupport::Supported } else { OverlaySupport::Unsupported };
+            }
+            _ => {}
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(x11) = &mut self.x11 {
+            x11.set_keys(keys);
+            self.shared.native.lock().unwrap().1.nonactivating_keys = super::keys::keys_support(keys, true);
+        }
+    }
+
     /// Applies requests from other threads: updates, edge, show and hide.
     pub(super) fn sync(&mut self, app: &mut dyn OverlayApp, event_loop: &ActiveEventLoop) {
         self.clipboard_due(app);
@@ -475,6 +508,7 @@ impl OverlayCore {
             }
         }
         if let Some(display) = requests.display { self.options.display = display; }
+        if let Some(keys) = requests.keys { self.set_keys(app, keys); }
         self.apply_wake(app, requests.woken);
         let mut at = self.at;
         at.edge = requests.edge.unwrap_or(at.edge);

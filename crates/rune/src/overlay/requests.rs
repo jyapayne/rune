@@ -24,6 +24,8 @@ pub(super) struct Requests {
     pub placement: Option<Option<crate::OverlayPlacement>>,
     pub exclusive_zone: Option<crate::ExclusiveZone>,
     pub display: Option<crate::DisplayTarget>,
+    /// `OverlayHandle::set_keys`: the overlay's new `KeyPolicy`.
+    pub keys: Option<crate::KeyPolicy>,
     pub request_keys: bool,
     /// Move to the display under the pointer now (`OverlayHandle::refollow_pointer`).
     pub refollow: bool,

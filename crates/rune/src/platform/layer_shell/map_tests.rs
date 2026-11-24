@@ -47,10 +47,16 @@ struct Seen {
 /// A compositor that knows a layer surface's rules as wlroots keeps them: the first commit of
 /// a role is answered with a configure, and a null buffer puts the role back where it began.
 /// It has `hyprland_focus_grab_manager_v1` too, and no seat.
-fn mock_compositor(mut server: UnixStream, seen: Arc<Mutex<Seen>>) -> std::thread::JoinHandle<()> {
+fn mock_compositor(server: UnixStream, seen: Arc<Mutex<Seen>>) -> std::thread::JoinHandle<()> {
+    mock_compositor_with(server, seen, false)
+}
+
+/// `mock_compositor`, with a seat that has a keyboard when `seat` says so.
+fn mock_compositor_with(mut server: UnixStream, seen: Arc<Mutex<Seen>>, seat: bool) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let (mut registry, mut compositor, mut shell, mut grabs) = (0u32, 0u32, 0u32, 0u32);
         let (mut surface, mut layer, mut grab) = (0u32, 0u32, 0u32);
+        let (mut seat_id, mut keyboard) = (0u32, 0u32);
         let (mut initialised, mut null_attached, mut serial) = (false, false, 0u32);
         let mut header = [0u8; 8];
         while server.read_exact(&mut header).is_ok() {
@@ -62,7 +68,8 @@ fn mock_compositor(mut server: UnixStream, seen: Arc<Mutex<Seen>>) -> std::threa
             let note = |what: String| seen.lock().unwrap().requests.push(what);
             if sender == 1 && opcode == 1 {
                 registry = u32_at(&payload, 0);
-                for (name, interface, version) in [(1, "wl_compositor", 6), (2, "zwlr_layer_shell_v1", 4), (3, "hyprland_focus_grab_manager_v1", 1)] {
+                let globals = [(1, "wl_compositor", 6), (2, "zwlr_layer_shell_v1", 4), (3, "hyprland_focus_grab_manager_v1", 1), (4, "wl_seat", 5)];
+                for (name, interface, version) in globals.into_iter().take(if seat { 4 } else { 3 }) {
                     let mut global = Vec::new();
                     push_u32(&mut global, name);
                     push_str(&mut global, interface);
@@ -79,8 +86,19 @@ fn mock_compositor(mut server: UnixStream, seen: Arc<Mutex<Seen>>) -> std::threa
                 match name {
                     1 => compositor = id,
                     2 => shell = id,
-                    _ => grabs = id,
+                    3 => grabs = id,
+                    _ => {
+                        // wl_seat.capabilities: a keyboard.
+                        seat_id = id;
+                        if send(&mut server, seat_id, 0, &2u32.to_ne_bytes()).is_err() { return; }
+                    }
                 }
+            } else if sender == seat_id && seat_id != 0 && opcode == 1 {
+                keyboard = u32_at(&payload, 0);
+                note("get_keyboard".into());
+            } else if sender == keyboard && keyboard != 0 && opcode == 0 {
+                note("release keyboard".into());
+                keyboard = 0;
             } else if sender == compositor && opcode == 0 {
                 surface = u32_at(&payload, 0);
                 note("create_surface".into());
@@ -290,6 +308,66 @@ fn an_exclusive_surface_asks_for_the_keys_as_it_shows_and_guards_itself_with_a_f
     layer.hide();
     turn_until(&host, &mut layer, false, |l| l.state.mapping == mapping::State::Unmapped);
     assert_eq!(requests(&host, &seen), ["set_keyboard_interactivity 0", "grab destroy", "attach nil", "commit unmap", "sync"]);
+
+    drop(layer);
+    drop(host);
+    drop(server_tx);
+    compositor.join().unwrap();
+    Ok(())
+}
+
+#[test]
+fn a_live_surface_switches_its_keys_between_none_exclusive_and_on_demand() -> std::io::Result<()> {
+    let (client, server) = UnixStream::pair()?;
+    let server_tx = server.try_clone()?;
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let compositor = mock_compositor_with(server, seen.clone(), true);
+    let Ok(host) = Connection::from_socket(client) else { return Ok(()); };
+
+    // A bar: shown, takes clicks and no keys. Its seat has a keyboard it doesn't ask for.
+    let mut layer = LayerSurface::new(display(&host), "bar", AT, true, &OverlayOptions::default(), None).expect("a layer surface");
+    turn_until(&host, &mut layer, false, |l| l.frame_ready());
+    assert_eq!(requests(&host, &seen), ["create_surface", "get_layer_surface", "set_size 200 100", "set_keyboard_interactivity 0", "commit", "ack 1"]);
+    layer.show(AT);
+    layer.request_frame();
+    layer.presented();
+    assert!(requests(&host, &seen).is_empty());
+    assert!(!layer.supports_keys());
+
+    // Exclusive while shown: the keyboard, the keys in a commit of their own, and the grab at
+    // once, since a buffer already maps the surface.
+    assert_eq!(layer.set_keys(KeyPolicy::Exclusive, true), None);
+    assert_eq!(requests(&host, &seen), ["get_keyboard", "set_keyboard_interactivity 1", "commit", "create_grab", "grab add_surface ours", "grab commit"]);
+    assert!(layer.supports_keys());
+    layer.state.step_keyboard_focus(keyboard::FocusEvent::EnterOurs);
+    assert!(matches!(layer.dispatch().input[..], [Input::Focus(true)]));
+    assert_eq!(layer.set_keys(KeyPolicy::Exclusive, true), None);
+    assert!(requests(&host, &seen).is_empty(), "the same policy again changes nothing");
+
+    // None again: the grab and the keyboard go, so the overlay hears the blur at once, and the
+    // surface asks for no keys.
+    layer.set_keys(KeyPolicy::None, true);
+    assert_eq!(requests(&host, &seen), ["grab destroy", "release keyboard", "set_keyboard_interactivity 0", "commit"]);
+    assert!(matches!(layer.dispatch().input[..], [Input::Focus(false)]));
+    assert!(!layer.has_keyboard_focus() && !layer.supports_keys());
+
+    // On demand: the keyboard, and keys only when asked for.
+    layer.set_keys(KeyPolicy::OnDemand, true);
+    assert_eq!(requests(&host, &seen), ["get_keyboard"], "showing on demand asks for nothing");
+    assert!(layer.request_keys());
+    assert_eq!(requests(&host, &seen), ["set_keyboard_interactivity 2", "commit"]);
+
+    // Hidden, a new policy waits for the show, which asks for it with the role state.
+    layer.hide();
+    turn_until(&host, &mut layer, false, |l| l.state.mapping == mapping::State::Unmapped);
+    assert_eq!(requests(&host, &seen), ["set_keyboard_interactivity 0", "attach nil", "commit unmap", "sync"]);
+    layer.set_keys(KeyPolicy::Exclusive, false);
+    assert!(requests(&host, &seen).is_empty(), "nothing on the wire for a hidden surface");
+    layer.show(AT);
+    turn_until(&host, &mut layer, true, |l| l.frame_ready());
+    assert_eq!(requests(&host, &seen), ["set_keyboard_interactivity 1", "set_size 200 100", "set_keyboard_interactivity 1", "commit", "ack 2"]);
+    layer.presented();
+    assert_eq!(requests(&host, &seen), ["create_grab", "grab add_surface ours", "grab commit"]);
 
     drop(layer);
     drop(host);

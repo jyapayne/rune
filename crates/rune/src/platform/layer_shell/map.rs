@@ -6,6 +6,7 @@
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1};
+use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 
 use super::super::layer_shell_machine::{exclusive_zone, frame_callback, keyboard, mapping, pointer, repeat, touch};
 use super::{LayerSurface, Over, Role, State};
@@ -169,6 +170,49 @@ impl LayerSurface {
         if self.interactivity == interactivity { return; }
         self.interactivity = interactivity;
         self.send_interactivity();
+    }
+
+    /// Changes the keyboard policy of a surface that lives on (`OverlayHandle::set_keys`). A
+    /// policy that takes keys gets what it needs now (the seat's keyboard, the input method, and
+    /// for `Exclusive` the focus grab manager); one that takes none lets the keyboard go, so its
+    /// overlay hears the blur at once, and turns the input method off, which is returned for the
+    /// overlay. Shown, the surface asks for what the new policy takes as it shows, in a commit
+    /// of its own: an `Exclusive` one the keys and, once a buffer maps it, its grab, which goes
+    /// with any other policy. Hidden, its next `show` asks. A lock surface keeps its keys.
+    pub fn set_keys(&mut self, keys: crate::KeyPolicy, shown: bool) -> Option<crate::Ime> {
+        if self.is_lock() || self.options.keys == keys { return None; }
+        self.options.keys = keys;
+        let qh = self.queue.handle();
+        let exclusive = keyboard::shown_interactivity(keys) == keyboard::Interactivity::Exclusive;
+        self.state.want_keys = keys.takes_keys();
+        if let Some(globals) = &self.globals {
+            if self.state.want_keys {
+                super::compose::warm();
+                if self.seat.is_none() { self.seat = self.seat_global.map(|(name, version)| globals.registry().bind(name, version, &qh, ())); }
+                if self.state.text_input_manager.is_none() { self.state.text_input_manager = globals.bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ()).ok(); }
+                if self.state.text_input.is_none() && let (Some(manager), Some(seat)) = (&self.state.text_input_manager, &self.seat) {
+                    self.state.text_input = Some(manager.get_text_input(seat, &qh, ()));
+                }
+            }
+            if exclusive && self.state.grab_manager.is_none() { self.state.grab_manager = globals.bind(&qh, 1..=1, ()).ok(); }
+        }
+        if !exclusive { self.state.release_grab(); }
+        let ime = if keys.takes_keys() { None } else {
+            self.sync_ime(crate::input::host_events::ImeStep { cancel: false, set_allowed: Some(false), cursor_area: None })
+        };
+        if let Some(seat) = &self.seat { self.state.update_seat(seat, &qh); }
+        let want = keyboard::shown_interactivity(keys);
+        if shown && self.interactivity != want {
+            self.ask_interactivity(want);
+            self.commit();
+        }
+        if shown && exclusive && matches!(self.state.mapping, mapping::State::Mapped { .. }) {
+            // Still entered after a dismissal, it has the focus back as when mapped again.
+            self.state.step_keyboard_focus(keyboard::FocusEvent::Mapped);
+            self.state.grab_focus(&self.surface, &qh);
+        }
+        self.flush_checked();
+        ime
     }
 
     /// Sends the keyboard interactivity the role state asks for; it waits for a commit. A lock

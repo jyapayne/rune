@@ -59,6 +59,8 @@ impl InputWindow {
         if !self.visible.get() || !self.keys.takes_keys() { return false; }
         self.connection.set_input_focus(InputFocus::PARENT, self.window, x11rb::CURRENT_TIME).ok().and_then(|r| r.check().ok()).is_some()
     }
+    /// `OverlayHandle::set_keys`: `request_keys` and a click focus the window by `keys` from now.
+    pub fn set_keys(&mut self, keys: crate::KeyPolicy) { self.keys = keys; }
     pub fn global_pointer(&self) -> crate::OverlaySupport {
         if self.input.get() != crate::OverlayInput::Regions && !self.follow.get() { return crate::OverlaySupport::Supported; }
         if self.watch.borrow().as_ref().is_some_and(|w| w.supported()) { crate::OverlaySupport::Supported } else { crate::OverlaySupport::Failed }

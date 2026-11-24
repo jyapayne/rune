@@ -144,6 +144,14 @@ impl Surface {
             Surface::None { .. } => None,
         }
     }
+
+    pub(super) fn backing_mut(&mut self) -> Option<&mut Backing> {
+        match self {
+            Surface::Live { live, .. } => Some(&mut live.backing),
+            Surface::Parked { backing, .. } => Some(backing),
+            Surface::None { .. } => None,
+        }
+    }
 }
 
 impl OverlayCore {

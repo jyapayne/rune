@@ -171,6 +171,7 @@ impl SharedCore {
     fn set_placement(&self, placement: Option<OverlayPlacement>) { self.request(|q| q.placement = Some(placement)); }
     fn set_exclusive_zone(&self, zone: crate::ExclusiveZone) { self.request(|q| q.exclusive_zone = Some(zone)); }
     fn set_display(&self, display: DisplayTarget) { self.request(|q| q.display = Some(display)); }
+    fn set_keys(&self, keys: KeyPolicy) { self.request(|q| q.keys = Some(keys)); }
     fn request_keys(&self) { self.request(|q| q.request_keys = true); }
     fn window_number(&self) -> Option<u32> { self.native.lock().unwrap().0 }
     fn capture_exclusion(&self) -> OverlaySupport { self.capabilities().capture_exclusion }
@@ -253,6 +254,16 @@ impl<T: 'static> OverlayHandle<T> {
     /// `KeyPolicy`). A `KeyPolicy::Exclusive` one on Wayland has the keys from its show.
     #[inline(always)]
     pub fn request_keys(&self) { self.shared.core.request_keys(); }
+
+    /// Changes the overlay's `KeyPolicy` while it runs: a panel that takes every key while the
+    /// user walks its controls from the keyboard, then none again. A policy that takes no keys
+    /// releases what keys held, as a hide does. Wayland: a shown layer surface asks for the new
+    /// keyboard interactivity in a commit of its own (an `Exclusive` one takes the keys at once
+    /// and guards itself with a focus grab), and a hidden one asks with its next show. Other
+    /// backends deliver keys by the new policy, and keep the activation style the window was
+    /// made with.
+    #[inline(always)]
+    pub fn set_keys(&self, keys: KeyPolicy) { self.shared.core.set_keys(keys); }
 
     /// macOS panel CGWindowID for an explicit ScreenCaptureKit exclusion filter. Available
     /// at native creation (see `on_created`/`prewarm`); a new one with each window made.
