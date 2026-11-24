@@ -21,6 +21,8 @@ mod states;
 mod system_material;
 mod window;
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+pub mod capture;
 pub mod clipboard;
 pub mod compose;
 pub mod drag_out;
