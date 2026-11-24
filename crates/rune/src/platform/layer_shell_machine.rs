@@ -740,13 +740,24 @@ pub(crate) mod frame_callback;
 pub(crate) mod pointer;
 pub(crate) mod text_input;
 
-/// The `zwlr_layer_surface_v1.set_exclusive_zone` value for `placement`: `-1` lets a full-screen
-/// overlay cover bars and other surfaces that reserve space; other placements keep `0` so they
-/// neither reserve space nor ignore other surfaces' exclusive zones.
-pub(crate) fn exclusive_zone(placement: Option<crate::OverlayPlacement>) -> i32 {
-    match placement {
-        Some(crate::OverlayPlacement::FullScreen) => -1,
-        Some(crate::OverlayPlacement::Edge { .. } | crate::OverlayPlacement::Rect { .. }) | None => 0,
+/// The `zwlr_layer_surface_v1.set_exclusive_zone` value. `Auto`: `-1` lets a full-screen overlay
+/// cover bars and other surfaces that reserve space; other placements keep `0` so they neither
+/// reserve space nor ignore other surfaces' exclusive zones. `Reserve` is a positive distance
+/// only for anchors the protocol honours it on (one edge, or one edge and both perpendicular
+/// ones): a bar, or an edge placement centred along its edge. The spec's own placement (`None`)
+/// may sit in a corner, so it reserves nothing.
+pub(crate) fn exclusive_zone(placement: Option<crate::OverlayPlacement>, zone: crate::ExclusiveZone) -> i32 {
+    use crate::{ExclusiveZone, OverlayPlacement};
+    match zone {
+        ExclusiveZone::IgnoreOthers => -1,
+        ExclusiveZone::Reserve(points) => match placement {
+            Some(OverlayPlacement::Bar { .. } | OverlayPlacement::Edge { align: crate::Align::Center, .. }) if points.is_finite() => points.round().max(0.0) as i32,
+            _ => 0,
+        },
+        ExclusiveZone::Auto => match placement {
+            Some(OverlayPlacement::FullScreen) => -1,
+            Some(OverlayPlacement::Edge { .. } | OverlayPlacement::Rect { .. } | OverlayPlacement::Bar { .. }) | None => 0,
+        },
     }
 }
 

@@ -54,6 +54,7 @@ members = [
     "examples/rich-clipboard",
     "examples/matched",
     "examples/launcher",
+    "examples/layer-bar",
     "examples/glass-card",
     "examples/glass-panel",
     "examples/frosted-bar",

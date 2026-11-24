@@ -59,6 +59,48 @@ pub enum OverlayPlacement {
     /// Elsewhere a rect off the primary display is exact only where displays share a scale.
     Rect { x: f32, y: f32, width: f32, height: f32 },
     FullScreen,
+    /// A bar docked along one whole edge: the compositor stretches it to the display's length
+    /// along `edge`, `thickness` points across, `margin` points in from the edge. Pair it with
+    /// [`ExclusiveZone::Reserve`] to push windows aside. Backends without layer-shell place a
+    /// window of the display's full length there and reserve nothing.
+    Bar { edge: BarEdge, thickness: f32, margin: f32 },
+}
+
+/// The edge an [`OverlayPlacement::Bar`] docks along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// The Wayland layer-shell layer an overlay's surface is on. Other backends ignore it and use
+/// [`OverlayLevel`]. `Top` is above windows but below fullscreen ones (a panel); `Bottom` and
+/// `Background` are under windows (desktop widgets, wallpaper); `Overlay` is above everything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaylandLayer {
+    Background,
+    Bottom,
+    Top,
+    #[default]
+    Overlay,
+}
+
+/// How a Wayland layer-shell overlay interacts with space reserved along display edges.
+/// Other backends ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ExclusiveZone {
+    /// A full-screen overlay covers surfaces that reserve space; any other is moved clear of
+    /// them and reserves nothing.
+    #[default]
+    Auto,
+    /// Reserve this many points from the docked edge, so the compositor keeps windows out of
+    /// them. Takes effect only where layer-shell allows it: an [`OverlayPlacement::Bar`], or
+    /// an [`OverlayPlacement::Edge`] centred along its edge; elsewhere it reserves nothing.
+    Reserve(f32),
+    /// Reserve nothing and extend under surfaces that do.
+    IgnoreOthers,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +183,10 @@ pub struct OverlayOptions {
     /// can't use it. Read when the surface is made, at each show on Wayland;
     /// `OverlayHandle::set_xwayland_input` changes it.
     pub xwayland_input: bool,
+    /// Wayland: the layer-shell layer. Read when the surface is made.
+    pub wayland_layer: WaylandLayer,
+    /// Wayland: space the overlay reserves, or how it treats space others reserve.
+    pub exclusive_zone: ExclusiveZone,
 }
 
 /// Keeps existing exhaustive `OverlaySpec` literals source compatible.
@@ -276,6 +322,15 @@ pub(crate) fn local_rect(at: crate::overlay::Placement, placement: Option<Overla
     let (edge, margin, align, inset) = match placement {
         Some(OverlayPlacement::FullScreen) => return [0.0, 0.0, area.0, area.1],
         Some(OverlayPlacement::Rect { x, y, width, height }) => return [x, y, width.max(1.0), height.max(1.0)],
+        Some(OverlayPlacement::Bar { edge, thickness, margin }) => {
+            let t = thickness.max(1.0);
+            return match edge {
+                BarEdge::Top => [0.0, margin, area.0, t],
+                BarEdge::Bottom => [0.0, area.1 - t - margin, area.0, t],
+                BarEdge::Left => [margin, 0.0, t, area.1],
+                BarEdge::Right => [area.0 - t - margin, 0.0, t, area.1],
+            };
+        }
         Some(OverlayPlacement::Edge { edge, margin, align, inset }) => (edge, margin, align, inset),
         None => (at.edge, at.margin, at.align, at.inset),
     };
@@ -345,5 +400,15 @@ mod tests {
         // A 2x display left of primary: scale local offsets, never the desktop origin.
         let r = local_rect(at, None, (960.0, 540.0));
         assert_eq!((-1920 + (r[0] * 2.0) as i32, -100 + (r[1] * 2.0) as i32), (-624, 772));
+    }
+
+    #[test]
+    fn a_bar_spans_the_display_along_its_edge_whatever_the_spec_size() {
+        let at = crate::overlay::Placement { size: (300.0, 80.0), edge: ScreenEdge::Top, margin: 0.0, align: Align::Center, inset: 0.0 };
+        let bar = |edge| local_rect(at, Some(OverlayPlacement::Bar { edge, thickness: 32.0, margin: 4.0 }), (960.0, 540.0));
+        assert_eq!(bar(BarEdge::Top), [0.0, 4.0, 960.0, 32.0]);
+        assert_eq!(bar(BarEdge::Bottom), [0.0, 504.0, 960.0, 32.0]);
+        assert_eq!(bar(BarEdge::Left), [4.0, 0.0, 32.0, 540.0]);
+        assert_eq!(bar(BarEdge::Right), [924.0, 0.0, 32.0, 540.0]);
     }
 }

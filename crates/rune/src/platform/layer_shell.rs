@@ -680,6 +680,15 @@ fn wait_for_configure(conn: &Connection, queue: &mut EventQueue<State>, state: &
     configure_wait::wait(&mut ConfigureDriver { conn, queue, state }, timeout)
 }
 
+fn wire_layer(layer: crate::WaylandLayer) -> Layer {
+    match layer {
+        crate::WaylandLayer::Background => Layer::Background,
+        crate::WaylandLayer::Bottom => Layer::Bottom,
+        crate::WaylandLayer::Top => Layer::Top,
+        crate::WaylandLayer::Overlay => Layer::Overlay,
+    }
+}
+
 fn destroy_proxy<P: Proxy>(proxy: &P) {
     if let Some(backend) = proxy.backend().upgrade() {
         backend.destroy_object(&proxy.id()).ok();
@@ -749,9 +758,9 @@ impl LayerSurface {
         let region = compositor.create_region(&qh, ());
         surface.set_input_region(Some(&region));
         region.destroy();
-        // Preserve existing overlay-layer semantics. There is no layer above Overlay;
-        // relative ordering of peers is compositor policy, unlike AppKit's numeric levels.
-        let layer = shell.get_layer_surface(&surface, output.as_ref(), Layer::Overlay, namespace.to_owned(), &qh, ());
+        // There is no layer above Overlay; relative ordering of peers on one layer is
+        // compositor policy, unlike AppKit's numeric levels.
+        let layer = shell.get_layer_surface(&surface, output.as_ref(), wire_layer(options.wayland_layer), namespace.to_owned(), &qh, ());
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
         let text_input_manager = want_keys
@@ -795,7 +804,7 @@ impl LayerSurface {
     }
 
     pub fn place(&mut self, at: Placement) {
-        self.layer.set_exclusive_zone(exclusive_zone(self.options.placement));
+        self.layer.set_exclusive_zone(exclusive_zone(self.options.placement, self.options.exclusive_zone));
         match self.options.placement {
             Some(OverlayPlacement::FullScreen) => {
                 self.layer.set_size(0, 0);
@@ -807,6 +816,21 @@ impl LayerSurface {
                 self.layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
                 self.layer.set_anchor(Anchor::Top | Anchor::Left);
                 self.layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
+                return;
+            }
+            Some(OverlayPlacement::Bar { edge, thickness, margin }) => {
+                // Zero along the edge: the compositor assigns the display's length there and
+                // reports it in `configure`.
+                let (t, m) = (thickness.ceil().max(1.0) as u32, margin.round() as i32);
+                let (anchor, size, margins) = match edge {
+                    crate::BarEdge::Top => (Anchor::Top | Anchor::Left | Anchor::Right, (0, t), (m, 0, 0, 0)),
+                    crate::BarEdge::Bottom => (Anchor::Bottom | Anchor::Left | Anchor::Right, (0, t), (0, 0, m, 0)),
+                    crate::BarEdge::Left => (Anchor::Left | Anchor::Top | Anchor::Bottom, (t, 0), (0, 0, 0, m)),
+                    crate::BarEdge::Right => (Anchor::Right | Anchor::Top | Anchor::Bottom, (t, 0), (0, m, 0, 0)),
+                };
+                self.layer.set_size(size.0, size.1);
+                self.layer.set_anchor(anchor);
+                self.layer.set_margin(margins.0, margins.1, margins.2, margins.3);
                 return;
             }
             _ => {}
