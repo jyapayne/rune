@@ -454,10 +454,10 @@ impl OverlayCore {
         if app.popup_open(&mut self.popup, window.as_ref(), true) { self.dirty = true; }
     }
 
-    /// Syncs OS IME allowance and cursor area for overlays that accept on-demand keyboard focus.
+    /// Syncs OS IME allowance and cursor area for overlays that may take keyboard focus.
     /// Returns true when the sync queued an immediate IME state event for the runtime.
     fn sync_ime(&mut self, app: &mut dyn OverlayApp) -> bool {
-        if self.options.keys != KeyPolicy::OnDemand { return false; }
+        if !self.options.keys.takes_keys() { return false; }
         let Some(live) = self.surface.live_mut() else { return false };
         match &mut live.backing {
             Backing::Window(window) => {

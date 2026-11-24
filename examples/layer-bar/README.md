@@ -4,13 +4,32 @@ A desktop panel with no app window: on every display, a bar docked along the top
 layer-shell `Top` layer, reserving its height so the compositor tiles windows below it, and a
 popup it toggles. Plugging a display in adds its bar; unplugging it removes it.
 
+The popup is a launcher's prompt. It takes every key while shown (`KeyPolicy::Exclusive`), so
+typing reaches its field with no click; Escape closes it, and so does a press anywhere outside
+it, which a compositor with `hyprland-focus-grab-v1` (Hyprland) reports as `on_focus(false)`.
+It is prewarmed, so closing it unmaps its surface and opening it maps the same one again.
+
 ```sh
-cargo run -p layer-bar             # stdin: toggle | quit
+cargo run -p layer-bar             # stdin: toggle | status | quit
 cargo run -p layer-bar -- --bottom
 ```
 
 `toggle` opens and closes the popup on the primary display's bar, or the first display's where
-none is primary (Wayland has no primary display).
+none is primary (Wayland has no primary display); `status` prints whether it is open and what
+its field holds.
+
+```rust
+OverlaySpec::new("layer-bar-popup", (280.0, 140.0), popup)
+    .options(OverlayOptions {
+        placement: Some(OverlayPlacement::Edge { edge, margin: 8.0, align: Align::End, inset: 8.0 }),
+        input: OverlayInput::All,
+        keys: KeyPolicy::Exclusive,
+        prewarm: true,
+        ..Default::default()
+    })
+    .on_key(popup_key)       // Escape, when nothing in the popup has focus
+    .on_focus(popup_focus)   // focus left, or a press outside ended its focus grab
+```
 
 ```rust
 let mut panels: Vec<Panel> = Vec::new();

@@ -26,8 +26,65 @@ fn keyboard_focus_emits_focus_edges_and_releases_on_seat_loss_or_other_surface()
 }
 
 #[test]
+fn a_cleared_focus_grab_reports_the_blur_once_and_keeps_the_keys() {
+    use super::keyboard::{FocusEffect, FocusEvent, FocusState, step};
+    let effects = |state: &mut FocusState, event| step(state, event).into_iter().collect::<Vec<_>>();
+
+    let mut state = FocusState::default();
+    assert_eq!(effects(&mut state, FocusEvent::GrabCleared), [], "nothing to lose before the keyboard enters");
+    assert!(!state.focused());
+    effects(&mut state, FocusEvent::EnterOurs);
+
+    // A press outside an exclusive surface: the compositor clears the grab and leaves the
+    // keyboard where it is. The overlay hears the blur; keys still reach it until it hides.
+    assert_eq!(effects(&mut state, FocusEvent::GrabCleared), [FocusEffect::Focus(false)]);
+    assert_eq!(state, FocusState::Dismissed);
+    assert!(state.focused(), "the compositor still sends it keys");
+    assert_eq!(effects(&mut state, FocusEvent::GrabCleared), [], "one blur for one dismissal");
+    // The leave that follows (its hide, or focus moving on) is the same loss of focus.
+    for leave in [FocusEvent::LeaveOurs, FocusEvent::EnterOther, FocusEvent::KeyboardGone] {
+        let mut state = FocusState::Dismissed;
+        assert_eq!(effects(&mut state, leave), [], "{leave:?}");
+        assert_eq!(state, FocusState::Unfocused);
+        assert!(!state.focused());
+    }
+    // Entered again without a leave between, it has the focus back.
+    assert_eq!(effects(&mut state, FocusEvent::EnterOurs), [FocusEffect::Focus(true)]);
+    assert_eq!(state, FocusState::Focused);
+
+    // A compositor with nothing else to focus sends neither a leave when the dismissed surface
+    // unmaps nor an enter when it maps again, and goes on sending it keys: the mapping is the
+    // focus coming back. A surface that was never dismissed, or never entered, hears nothing.
+    assert_eq!(effects(&mut state, FocusEvent::Mapped), [], "it never lost the focus");
+    effects(&mut state, FocusEvent::GrabCleared);
+    assert_eq!(effects(&mut state, FocusEvent::Mapped), [FocusEffect::Focus(true)]);
+    assert_eq!(state, FocusState::Focused);
+    let mut unfocused = FocusState::Unfocused;
+    assert_eq!(effects(&mut unfocused, FocusEvent::Mapped), [], "only an enter gives a surface the keyboard");
+    assert!(!unfocused.focused());
+
+    // Every short sequence: blurs and focuses alternate, starting with a focus.
+    let alphabet = [FocusEvent::EnterOurs, FocusEvent::EnterOther, FocusEvent::LeaveOurs, FocusEvent::KeyboardGone, FocusEvent::GrabCleared, FocusEvent::Mapped];
+    let mut sequence = vec![0usize; 6];
+    loop {
+        let (mut state, mut told) = (FocusState::default(), false);
+        for &i in &sequence {
+            for FocusEffect::Focus(focused) in step(&mut state, alphabet[i]) {
+                assert_ne!(focused, told, "the overlay was told {focused} twice in {sequence:?}");
+                told = focused;
+            }
+            assert_eq!(told, state == FocusState::Focused, "after {sequence:?}");
+            assert!(state.focused() || !told);
+        }
+        let Some(next) = sequence.iter().position(|&i| i + 1 < alphabet.len()) else { break };
+        sequence[next] += 1;
+        sequence[..next].fill(0);
+    }
+}
+
+#[test]
 fn layer_shell_key_translation_handles_ctrl_modifiers_space_and_non_ascii_layouts() {
-    use super::keyboard::{can_request_keys, key_event_from, supports_keys};
+    use super::keyboard::{Interactivity, key_event_from, requested_interactivity, shown_interactivity, supports_keys};
     use crate::{Key, KeyPolicy, Mods, PhysicalKeyCode};
 
     let ctrl = Mods { ctrl: true, cmd: true, ..Default::default() };
@@ -49,12 +106,23 @@ fn layer_shell_key_translation_handles_ctrl_modifiers_space_and_non_ascii_layout
         Some(Key::Command('c'))
     );
     // KeyPolicy::None must never report or request keyboard interactivity even with a seat.
-    assert!(!can_request_keys(KeyPolicy::None, 4));
+    assert_eq!(requested_interactivity(KeyPolicy::None, 4), None);
+    assert_eq!(shown_interactivity(KeyPolicy::None), Interactivity::None);
     assert!(!supports_keys(KeyPolicy::None, 4, true));
-    assert!(can_request_keys(KeyPolicy::OnDemand, 4));
+    // OnDemand asks only on `request_keys`, and needs layer-shell v4 and a seat.
+    assert_eq!(shown_interactivity(KeyPolicy::OnDemand), Interactivity::None, "showing alone never asks for focus");
+    assert_eq!(requested_interactivity(KeyPolicy::OnDemand, 4), Some(Interactivity::OnDemand));
+    assert_eq!(requested_interactivity(KeyPolicy::OnDemand, 3), None);
     assert!(supports_keys(KeyPolicy::OnDemand, 4, true));
     assert!(!supports_keys(KeyPolicy::OnDemand, 3, true));
     assert!(!supports_keys(KeyPolicy::OnDemand, 4, false));
+    // Exclusive asks as it shows, on any layer-shell version; it still needs a seat's keyboard.
+    assert_eq!(shown_interactivity(KeyPolicy::Exclusive), Interactivity::Exclusive);
+    for version in 1..=4 {
+        assert_eq!(requested_interactivity(KeyPolicy::Exclusive, version), Some(Interactivity::Exclusive), "v{version}");
+        assert!(supports_keys(KeyPolicy::Exclusive, version, true), "v{version}");
+        assert!(!supports_keys(KeyPolicy::Exclusive, version, false), "v{version}");
+    }
 }
 
 #[test]

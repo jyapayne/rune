@@ -1,6 +1,6 @@
 //! X11 input SHAPE regions. The visual surface stays intact; only pointer ownership changes.
 //! An override-redirect window gets no focus from the window manager, so an overlay that may take
-//! keys (`KeyPolicy::OnDemand`) sets the input focus itself.
+//! keys (`KeyPolicy::takes_keys`) sets the input focus itself.
 
 use x11rb::{connection::Connection, protocol::{shape::{ConnectionExt as _, SK, SO}, xproto::{ConnectionExt as _, ClipOrdering, ConfigureWindowAux, InputFocus, Rectangle, StackMode}}, rust_connection::RustConnection};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -56,7 +56,7 @@ impl InputWindow {
     /// panel takes it. Focus reverts to the root window when it hides, for the window manager to
     /// hand on. False when its policy takes no keys or the server refused (not yet mapped).
     pub fn request_keys(&self) -> bool {
-        if !self.visible.get() || !crate::overlay::keys::can_take_keys(self.keys) { return false; }
+        if !self.visible.get() || !self.keys.takes_keys() { return false; }
         self.connection.set_input_focus(InputFocus::PARENT, self.window, x11rb::CURRENT_TIME).ok().and_then(|r| r.check().ok()).is_some()
     }
     pub fn global_pointer(&self) -> crate::OverlaySupport {

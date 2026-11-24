@@ -105,6 +105,14 @@ impl OverlayCore {
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     fn surface_input(&mut self, app: &mut dyn OverlayApp, input: crate::platform::layer_shell::Input) {
         use crate::platform::layer_shell::Input;
+        // A compositor holding the overlay's focus grab (Hyprland, for `KeyPolicy::Exclusive`)
+        // sends it the press that lands outside it, at a position outside its bounds, before
+        // ending the grab. That press is not the overlay's, wherever its pointer last was.
+        if matches!(input, Input::Button(true) | Input::Secondary(true) | Input::ExtraButton(_, true))
+            && !app.rt().pointer().is_some_and(|at| press_on_surface(self.at.size, app.rt().zoom(), at))
+        {
+            return;
+        }
         match input {
             Input::Move(x, y) => {
                 let zoom = app.rt().zoom();
@@ -126,7 +134,7 @@ impl OverlayCore {
             }
             Input::Focus(focused) => {
                 app.window_focus(focused);
-                if !focused && self.options.keys == KeyPolicy::OnDemand {
+                if !focused && self.options.keys.takes_keys() {
                     self.ime.clear();
                     if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut()
                         && let Some(ime) = layer.sync_ime(crate::input::host_events::ImeStep {
@@ -155,7 +163,7 @@ impl OverlayCore {
                 self.dirty |= app.physical_with_fallback(event, fallback.filter(|_| keep));
                 return;
             }
-            Input::Ime(ime) if self.options.keys == KeyPolicy::OnDemand => {
+            Input::Ime(ime) if self.options.keys.takes_keys() => {
                 deliver_layer_ime(app.rt_mut(), &mut self.ime, ime);
             }
             Input::Ime(_) => return,
@@ -163,3 +171,15 @@ impl OverlayCore {
         self.dirty = true;
     }
 }
+
+/// Whether a press with the runtime's pointer at `at` (points of the zoomed view) lands on a
+/// surface `size` points across. A pointer the compositor reports beyond the surface's edges
+/// is over something else.
+#[cfg_attr(not(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))), allow(dead_code))]
+fn press_on_surface(size: (f32, f32), zoom: f32, (x, y): (f32, f32)) -> bool {
+    x >= 0.0 && y >= 0.0 && x * zoom < size.0 && y * zoom < size.1
+}
+
+#[cfg(test)]
+#[path = "layer_tests.rs"]
+mod tests;

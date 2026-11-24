@@ -43,8 +43,9 @@ fn a_surface_draws_only_once_its_configure_is_acked() {
     assert_eq!(state.take_size(), Some((280, 140)));
     assert_eq!(state.take_size(), None, "a size is read once");
 
-    assert_eq!(run(&mut seq, &mut state, Event::Presented), []);
+    assert_eq!(run(&mut seq, &mut state, Event::Presented), [Effect::Mapped], "the first buffer maps it");
     assert_eq!(state, State::Mapped { size: None });
+    assert_eq!(run(&mut seq, &mut state, Event::Presented), [], "later frames map nothing anew");
     // The compositor resizes a mapped surface: acked, and the newest size nobody read wins.
     assert_eq!(run(&mut seq, &mut state, Event::Configure { serial: 8, width: 10, height: 20 }), [Effect::Ack(8)]);
     assert_eq!(run(&mut seq, &mut state, Event::Configure { serial: 9, width: 30, height: 40 }), [Effect::Ack(9)]);
@@ -78,7 +79,7 @@ fn hiding_a_mapped_surface_unmaps_it_and_the_next_show_waits_for_a_new_configure
     assert!(!state.drawable(), "the remap draws nothing until its own configure");
     assert_eq!(run(&mut seq, &mut state, configure(4)), [Effect::Ack(4)]);
     assert!(state.drawable());
-    assert_eq!(run(&mut seq, &mut state, Event::Presented), []);
+    assert_eq!(run(&mut seq, &mut state, Event::Presented), [Effect::Mapped], "each show's first buffer maps it again");
     assert!(matches!(state, State::Mapped { .. }));
 }
 
@@ -209,8 +210,9 @@ fn each_sequence<T: Copy>(alphabet: &[T], depth: usize, seq: &mut Vec<T>, each: 
 /// The compositor's side of the protocol, as wlroots keeps it: a commit without a buffer
 /// initialises the role, a configure may be acked only while initialised, a buffer may be
 /// attached only once one was acked, and a null buffer on a mapped surface resets it all.
+/// `guarded`: the machine said the surface is mapped, which is when a focus grab may name it.
 #[derive(Default)]
-struct Compositor { initialised: bool, acked: bool, buffer: bool }
+struct Compositor { initialised: bool, acked: bool, buffer: bool, guarded: bool }
 
 #[test]
 fn no_sequence_breaks_the_protocol() {
@@ -255,6 +257,10 @@ fn no_sequence_breaks_the_protocol() {
                         assert!(fence.is_none(), "an ack of a configure from before the unmap in {asks:?}");
                         wire.acked = true;
                     }
+                    Effect::Mapped => {
+                        assert!(wire.buffer && !wire.guarded, "mapped twice, or with no buffer, in {asks:?}");
+                        wire.guarded = true;
+                    }
                     Effect::Unmap { fence: sent } => {
                         assert!(wire.buffer, "an unmap of a surface with no buffer in {asks:?}");
                         wire = Compositor::default();
@@ -267,6 +273,7 @@ fn no_sequence_breaks_the_protocol() {
             assert_eq!(state.drawable(), wire.acked && state.gone().is_none(), "drawable after {asks:?}");
             assert_eq!(state.committed(), wire.initialised && state.gone().is_none(), "committed after {asks:?}");
             assert_eq!(matches!(state, State::Mapped { .. }), wire.buffer && state.gone().is_none(), "mapped after {asks:?}");
+            assert_eq!(wire.guarded, wire.buffer, "every mapping is announced once, in {asks:?}");
         }
     });
 }

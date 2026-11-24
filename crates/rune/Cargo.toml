@@ -167,6 +167,9 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Generates `hyprland-focus-grab-v1` from `protocols/` (`platform::layer_shell::focus_grab`); the
+# same scanner the wayland-protocols crates above are generated with.
+wayland-scanner = "0.31"
 x11rb = { version = "0.13", features = ["shape", "xinput", "randr", "allow-unsafe-code", "dl-libxcb"] }
 xkbcommon = "0.9"
 

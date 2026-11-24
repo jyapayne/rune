@@ -66,8 +66,12 @@ pub(crate) enum Effect {
     Commit,
     /// `zwlr_layer_surface_v1.ack_configure`.
     Ack(u32),
-    /// Let go of what the mapped surface held (focus, IME, key repeat, the pointer over it, its
-    /// frame callback), attach a null buffer, commit, and `wl_display.sync` with this fence.
+    /// The first buffer since the configure mapped the surface: guard it with a focus grab,
+    /// where its overlay holds one.
+    Mapped,
+    /// Let go of what the mapped surface held (focus and its grab, IME, key repeat, the pointer
+    /// over it, its frame callback), attach a null buffer, commit, and `wl_display.sync` with
+    /// this fence.
     Unmap { fence: Attempt },
     /// Wake at the configure deadline, to feed `Event::Timeout` back.
     WakeAt(Instant),
@@ -112,7 +116,10 @@ pub(crate) fn step(seq: &mut Seq, state: &mut State, event: Event) -> Effects<Ef
         // Reset by the unmap, the surface owes no ack until its next commit asks for one.
         (State::Unmapped | State::Unmapping { .. }, Event::Configure { .. }) => {}
 
-        (State::Configured { size }, Event::Presented) => *state = State::Mapped { size },
+        (State::Configured { size }, Event::Presented) => {
+            *state = State::Mapped { size };
+            return Effects::one(Effect::Mapped);
+        }
         (_, Event::Presented) => {}
 
         (State::AwaitingConfigure { attempt, due }, Event::Timeout { attempt: fired, now }) if attempt == fired && now >= due => {
@@ -139,7 +146,6 @@ pub(crate) enum Gone {
     Unanswered,
 }
 
-#[cfg_attr(not(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))), allow(dead_code))]
 impl State {
     /// A configure is acked: a frame may attach a buffer.
     pub(crate) fn drawable(&self) -> bool { matches!(self, State::Configured { .. } | State::Mapped { .. }) }

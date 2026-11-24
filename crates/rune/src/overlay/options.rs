@@ -131,6 +131,27 @@ pub enum KeyPolicy {
     /// `WS_EX_NOACTIVATE`, and `request_keys` takes the foreground only when Windows lets this
     /// process (it just had the user's input, or was given the right); a click always does.
     OnDemand,
+    /// Takes every key while shown, without a click or `request_keys`: a launcher or a prompt.
+    /// Wayland: the layer surface asks for exclusive keyboard interactivity as it shows and
+    /// drops it as it hides (any layer-shell version), so the compositor sends it the keys
+    /// from its first frame. An exclusive surface hears no press outside itself, so where the
+    /// compositor has `hyprland-focus-grab-v1` the overlay also holds a focus grab on its own
+    /// surface while shown: a press or touch anywhere else ends the grab, and the overlay
+    /// hears it as `ConfiguredOverlay::on_focus(false)`, once, to dismiss itself. It keeps the
+    /// keys until it hides. Without that protocol only a lost keyboard focus reports a blur.
+    /// Every other backend treats it as [`KeyPolicy::OnDemand`], and XWayland can't.
+    Exclusive,
+}
+
+impl KeyPolicy {
+    /// Whether the overlay may take the keyboard at all: everything a keyboard needs (a seat's
+    /// keys, an input method, focus reports, releasing held keys on hide) follows this.
+    pub fn takes_keys(self) -> bool {
+        match self {
+            KeyPolicy::None => false,
+            KeyPolicy::OnDemand | KeyPolicy::Exclusive => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

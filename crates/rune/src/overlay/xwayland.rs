@@ -26,10 +26,10 @@ impl OverlayCore {
 }
 
 /// Whether an overlay may show on XWayland: one that takes no input always may; one that takes
-/// the pointer only by its host's opt-in; one that asks for keys never does.
+/// the pointer only by its host's opt-in; one that takes keys never does.
 #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
 pub(super) fn xwayland_allowed(input: OverlayInput, keys: KeyPolicy, opted_in: bool) -> bool {
-    keys != KeyPolicy::OnDemand && (input == OverlayInput::None || opted_in)
+    !keys.takes_keys() && (input == OverlayInput::None || opted_in)
 }
 
 /// Visibility and input state of an `XwaylandSurface`.

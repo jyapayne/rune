@@ -238,7 +238,7 @@ impl OverlayCore {
     #[cfg(target_os = "macos")]
     pub(super) fn fn_key(&mut self, app: &mut dyn OverlayApp) {
         let Some(changes) = self.surface.live().and_then(|l| l.fn_key.as_ref()).map(|f| f.take()) else { return };
-        if !self.presence.shown() || self.options.keys != KeyPolicy::OnDemand { return; }
+        if !self.presence.shown() || !self.options.keys.takes_keys() { return; }
         for pressed in changes {
             self.dirty |= app.physical_with_fallback(crate::PhysicalInput::Key {
                 key: winit::keyboard::KeyCode::Fn, mods: crate::window::map_mods(self.mods), pressed, repeat: false,
@@ -530,16 +530,16 @@ impl OverlayCore {
             if let Some(x11) = &self.x11 { self.shared.native.lock().unwrap().1.global_pointer = x11.global_pointer(); }
         }
         #[cfg(target_os = "macos")]
-        if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
+        if requests.request_keys && self.presence.shown() && self.options.keys.takes_keys()
             && let Some(panel) = &self.panel { panel.request_keys(); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
+        if requests.request_keys && self.presence.shown() && self.options.keys.takes_keys()
             && let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() { layer.request_keys(); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
+        if requests.request_keys && self.presence.shown() && self.options.keys.takes_keys()
             && let Some(x11) = &self.x11 { x11.request_keys(); }
         #[cfg(target_os = "windows")]
-        if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
+        if requests.request_keys && self.presence.shown() && self.options.keys.takes_keys()
             && let Some(native) = &self.native { native.request_keys(); }
     }
 }

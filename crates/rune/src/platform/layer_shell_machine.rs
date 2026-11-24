@@ -69,16 +69,25 @@ pub(crate) mod touch {
 pub(crate) mod keyboard {
     use crate::machine::Effects;
 
+    /// Whether the compositor sends the surface keys, and what its overlay has been told. It
+    /// follows the compositor's own enter and leave, not the surface's mapping: a compositor
+    /// with nothing else to focus (Hyprland on an empty workspace) leaves the keyboard on a
+    /// surface that unmapped, sends no enter when it maps again, and keeps sending it keys.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) enum FocusState {
         #[default]
         Unfocused,
         Focused,
+        /// Still entered, so keys keep coming, but the compositor cleared the focus grab that
+        /// guarded the surface (a press outside it) and the overlay was told focus left. The
+        /// leave that follows says nothing more; mapped again before any, it has the focus.
+        Dismissed,
     }
 
     impl FocusState {
+        /// The compositor sends the surface keys.
         #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
-        pub(crate) fn focused(self) -> bool { matches!(self, FocusState::Focused) }
+        pub(crate) fn focused(self) -> bool { matches!(self, FocusState::Focused | FocusState::Dismissed) }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +96,10 @@ pub(crate) mod keyboard {
         EnterOther,
         LeaveOurs,
         KeyboardGone,
+        /// The compositor cleared the surface's focus grab: the user pressed outside it.
+        GrabCleared,
+        /// A show's first buffer mapped the surface.
+        Mapped,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,16 +107,25 @@ pub(crate) mod keyboard {
         Focus(bool),
     }
 
-    /// Transitions keyboard focus and emits `Focus(true)` / `Focus(false)` only on real edges.
+    /// Transitions keyboard focus and emits `Focus(true)` / `Focus(false)` only on real edges:
+    /// a cleared grab and the leave after it are one loss of focus.
     pub(crate) fn step(state: &mut FocusState, event: FocusEvent) -> Effects<FocusEffect> {
         match (*state, event) {
-            (FocusState::Unfocused, FocusEvent::EnterOurs) => {
+            (FocusState::Unfocused | FocusState::Dismissed, FocusEvent::EnterOurs) | (FocusState::Dismissed, FocusEvent::Mapped) => {
                 *state = FocusState::Focused;
                 Effects::one(FocusEffect::Focus(true))
             }
             (FocusState::Focused, FocusEvent::EnterOther | FocusEvent::LeaveOurs | FocusEvent::KeyboardGone) => {
                 *state = FocusState::Unfocused;
                 Effects::one(FocusEffect::Focus(false))
+            }
+            (FocusState::Focused, FocusEvent::GrabCleared) => {
+                *state = FocusState::Dismissed;
+                Effects::one(FocusEffect::Focus(false))
+            }
+            (FocusState::Dismissed, FocusEvent::EnterOther | FocusEvent::LeaveOurs | FocusEvent::KeyboardGone) => {
+                *state = FocusState::Unfocused;
+                Effects::none()
             }
             _ => Effects::none(),
         }
@@ -235,15 +257,37 @@ pub(crate) mod keyboard {
         }
     }
 
-    /// Whether a layer-shell overlay with `policy` may request keyboard interactivity on
-    /// `zwlr_layer_surface_v1` `layer_version`.
-    pub(crate) fn can_request_keys(policy: crate::KeyPolicy, layer_version: u32) -> bool {
-        policy == crate::KeyPolicy::OnDemand && layer_version >= 4
+    /// The keyboard interactivity a layer surface's role state asks the compositor for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Interactivity {
+        None,
+        OnDemand,
+        Exclusive,
+    }
+
+    /// What a surface asks for as its overlay shows: an `Exclusive` one takes every key from
+    /// its first frame, on any layer-shell version; an `OnDemand` one asks for nothing until
+    /// `request_keys`.
+    pub(crate) fn shown_interactivity(policy: crate::KeyPolicy) -> Interactivity {
+        match policy {
+            crate::KeyPolicy::Exclusive => Interactivity::Exclusive,
+            crate::KeyPolicy::OnDemand | crate::KeyPolicy::None => Interactivity::None,
+        }
+    }
+
+    /// What `request_keys` asks for, when `policy` and `zwlr_layer_surface_v1` `layer_version`
+    /// allow it: on-demand interactivity came with version 4, exclusive with the first.
+    pub(crate) fn requested_interactivity(policy: crate::KeyPolicy, layer_version: u32) -> Option<Interactivity> {
+        match policy {
+            crate::KeyPolicy::OnDemand if layer_version >= 4 => Some(Interactivity::OnDemand),
+            crate::KeyPolicy::Exclusive => Some(Interactivity::Exclusive),
+            crate::KeyPolicy::OnDemand | crate::KeyPolicy::None => None,
+        }
     }
 
     /// Whether a layer-shell overlay reports `nonactivating_keys` support.
     pub(crate) fn supports_keys(policy: crate::KeyPolicy, layer_version: u32, has_seat: bool) -> bool {
-        can_request_keys(policy, layer_version) && has_seat
+        requested_interactivity(policy, layer_version).is_some() && has_seat
     }
 
     /// Maximum size accepted for a Wayland `wl_keyboard.keymap` payload (16 MiB).

@@ -56,14 +56,15 @@ impl State {
         }
     }
 
-    /// Lets go of what a mapped surface held, before its null buffer: keyboard focus, key
+    /// Lets go of what a mapped surface held, before its null buffer: the grab guarding it, key
     /// repeat, a compose sequence, the input method, the pointer and finger over it, the frame
-    /// callback it waited on and input not yet delivered. The compositor's own leave events
-    /// follow and find nothing left to undo.
+    /// callback it waited on and input not yet delivered. Keyboard focus is the compositor's
+    /// to take: its `leave` says when (`keyboard::FocusState`), and until then a hidden
+    /// surface's keys are dropped as they come (`LayerSurface::drain`).
     fn release_mapped(&mut self, conn: &Connection) {
+        self.release_grab();
         self.step_repeat(repeat::Event::Stop);
         self.reset_compose();
-        self.step_keyboard_focus(keyboard::FocusEvent::LeaveOurs);
         self.drain_text_input();
         self.over = Over::Outside;
         self.step_pointer(pointer::Event::Reset);
@@ -130,9 +131,11 @@ impl LayerSurface {
 
     /// The overlay shows. A surface the last hide unmapped commits its role state again and
     /// waits for the compositor's configure, which a later `dispatch` acks: nothing blocks
-    /// here, and `frame_ready` says when a frame may draw.
+    /// here, and `frame_ready` says when a frame may draw. One that takes every key asks for
+    /// them from here, so the compositor has them with its first buffer.
     pub fn show(&mut self, at: Placement) {
         self.at = at;
+        self.ask_interactivity(keyboard::shown_interactivity(self.options.keys));
         self.state.step_mapping(mapping::Event::Map { now: crate::time::now() });
         self.carry_out();
         self.flush_checked();
@@ -142,8 +145,7 @@ impl LayerSurface {
     /// surface back in the state it was made in; the `wl_surface`, the layer surface and what
     /// draws into them stay for the next `show`.
     pub fn hide(&mut self) {
-        self.interactivity = KeyboardInteractivity::None;
-        self.layer.set_keyboard_interactivity(self.interactivity);
+        self.ask_interactivity(keyboard::Interactivity::None);
         self.state.step_mapping(mapping::Event::Unmap);
         self.carry_out();
         self.flush_checked();
@@ -152,7 +154,27 @@ impl LayerSurface {
     /// A frame presented: wgpu committed a buffer, so the compositor shows the surface.
     pub fn presented(&mut self) {
         self.state.step_mapping(mapping::Event::Presented);
-        self.carry_out();
+        // Only a show's first buffer asks for anything: the grab that guards the mapped surface.
+        if !self.state.asked.is_empty() {
+            self.carry_out();
+            self.flush_checked();
+        }
+    }
+
+    /// Changes the keyboard interactivity the role state asks for; it waits for a commit.
+    fn ask_interactivity(&mut self, interactivity: keyboard::Interactivity) {
+        if self.interactivity == interactivity { return; }
+        self.interactivity = interactivity;
+        self.send_interactivity();
+    }
+
+    /// Sends the keyboard interactivity the role state asks for; it waits for a commit.
+    pub(super) fn send_interactivity(&self) {
+        self.layer.set_keyboard_interactivity(match self.interactivity {
+            keyboard::Interactivity::None => KeyboardInteractivity::None,
+            keyboard::Interactivity::OnDemand => KeyboardInteractivity::OnDemand,
+            keyboard::Interactivity::Exclusive => KeyboardInteractivity::Exclusive,
+        });
     }
 
     /// When the compositor's configure is overdue, for the overlay's wake timer.
@@ -183,12 +205,16 @@ impl LayerSurface {
             match effect {
                 mapping::Effect::Commit => {
                     self.place(self.at);
-                    self.layer.set_keyboard_interactivity(self.interactivity);
+                    self.send_interactivity();
                     self.send_input_region();
                     self.set_buffer_scale(self.buffer_scale);
                     self.surface.commit();
                 }
                 mapping::Effect::Ack(serial) => self.layer.ack_configure(serial),
+                mapping::Effect::Mapped => {
+                    self.state.step_keyboard_focus(keyboard::FocusEvent::Mapped);
+                    self.state.grab_focus(&self.surface, &self.queue.handle());
+                }
                 mapping::Effect::Unmap { fence } => {
                     self.state.release_mapped(&self.conn);
                     self.surface.attach(None, 0, 0);

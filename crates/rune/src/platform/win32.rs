@@ -455,7 +455,7 @@ impl OverlayWindow {
     /// otherwise the window stays as it is and takes the keys when clicked. False when its policy
     /// takes no keys or this process may not take the foreground.
     pub fn request_keys(&self) -> bool {
-        self.input.visible.get() && crate::overlay::keys::can_take_keys(self.keys) && cloak::take_foreground(self.input.hwnd)
+        self.input.visible.get() && self.keys.takes_keys() && cloak::take_foreground(self.input.hwnd)
     }
     /// Keeps the shown window up at `alpha` (255 opaque) while it fades out, taking no clicks.
     #[allow(unsafe_code)]
@@ -492,7 +492,7 @@ impl Drop for OverlayWindow {
 }
 
 /// A layered, topmost tool window that never activates, unless its policy takes keys
-/// (`KeyPolicy::OnDemand`: a click or `request_keys` activates it); unless `mode` takes every
+/// (`KeyPolicy::takes_keys`: a click or `request_keys` activates it); unless `mode` takes every
 /// click, every click goes through (`Input::observe` lifts that over input regions). Windows composes a
 /// layered window, its DirectComposition content included, only once it has layered
 /// attributes: without them it stays invisible however often it is shown (#510 in Hex).
@@ -500,7 +500,7 @@ impl Drop for OverlayWindow {
 #[allow(unsafe_code)]
 fn overlay_styles(hwnd: HWND, mode: OverlayInput, keys: crate::KeyPolicy) -> Result<(), String> {
     let through = if mode == OverlayInput::All { 0 } else { WS_EX_TRANSPARENT };
-    let no_activate = if crate::overlay::keys::can_take_keys(keys) { 0 } else { WS_EX_NOACTIVATE };
+    let no_activate = if keys.takes_keys() { 0 } else { WS_EX_NOACTIVATE };
     // SAFETY: style changes on a live window owned by this thread.
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;

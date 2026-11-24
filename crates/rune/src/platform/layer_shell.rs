@@ -20,7 +20,7 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1:
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1};
-use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{KeyboardInteractivity, ZwlrLayerSurfaceV1};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 
 use super::layer_shell_machine::{connection, frame_callback, keyboard, mapping, pointer, repeat, text_input as text_input_machine, touch};
 use crate::machine::Seq;
@@ -29,6 +29,7 @@ use crate::{OverlayInput, OverlayOptions, OverlayPlacement};
 
 mod compose;
 mod dead;
+mod focus_grab;
 mod keys;
 mod map;
 mod pointing;
@@ -90,6 +91,10 @@ struct State {
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
     text_input_state: text_input_machine::State,
+    /// `hyprland_focus_grab_manager_v1`, bound for an overlay that takes every key where the
+    /// compositor has it, and the grab that guards the surface while a buffer maps it.
+    grab_manager: Option<focus_grab::HyprlandFocusGrabManagerV1>,
+    grab: Option<focus_grab::HyprlandFocusGrabV1>,
 }
 
 impl Dispatch<WlOutput, ()> for State {
@@ -207,8 +212,9 @@ pub(crate) struct LayerSurface {
     surface: WlSurface,
     /// Where the role state last put the surface, for the commit that maps it again.
     at: Placement,
-    /// The keyboard interactivity the role state asks for: none until the overlay asks for keys.
-    interactivity: KeyboardInteractivity,
+    /// The keyboard interactivity the role state asks for: what its policy takes as it shows
+    /// or on `request_keys`, and none once hidden.
+    interactivity: keyboard::Interactivity,
     buffer_scale: i32,
     display: NonNull<std::ffi::c_void>,
 }
@@ -251,7 +257,7 @@ impl LayerSurface {
     #[allow(unsafe_code)]
     pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
-        let want_keys = options.keys == crate::KeyPolicy::OnDemand;
+        let want_keys = options.keys.takes_keys();
         if want_keys { compose::warm(); }
         // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
         // every overlay; a foreign backend never closes it.
@@ -300,6 +306,9 @@ impl LayerSurface {
             .as_ref()
             .zip(seat.as_ref())
             .map(|(manager, seat)| manager.get_text_input(seat, &qh, ()));
+        let grab_manager = (keyboard::shown_interactivity(options.keys) == keyboard::Interactivity::Exclusive)
+            .then(|| globals.bind::<focus_grab::HyprlandFocusGrabManagerV1, _, _>(&qh, 1..=1, ()).ok())
+            .flatten();
         let state = State {
             surface: Some(surface.clone()),
             want_pointer,
@@ -307,6 +316,7 @@ impl LayerSurface {
             shapes,
             text_input_manager,
             text_input,
+            grab_manager,
             ..State::default()
         };
         let mut this = LayerSurface {
@@ -314,7 +324,7 @@ impl LayerSurface {
             // Takes no input until the first frame publishes its hit regions.
             regions: std::cell::RefCell::new(Some(Vec::new())),
             compositor, shell, output, seat, options: options.clone(), queue, state, layer, surface,
-            at, interactivity: KeyboardInteractivity::None, buffer_scale: 1, display: display.display,
+            at, interactivity: keyboard::Interactivity::None, buffer_scale: 1, display: display.display,
         };
         this.state.step_mapping(mapping::Event::Map { now: crate::time::now() });
         this.carry_out();
@@ -371,9 +381,9 @@ impl LayerSurface {
     /// Asks the compositor for the keys; false when the policy or the layer-shell version
     /// can't. The surface keeps asking until it hides.
     pub fn request_keys(&mut self) -> bool {
-        if !keyboard::can_request_keys(self.options.keys, self.layer.version()) { return false; }
-        self.interactivity = KeyboardInteractivity::OnDemand;
-        self.layer.set_keyboard_interactivity(self.interactivity);
+        let Some(interactivity) = keyboard::requested_interactivity(self.options.keys, self.layer.version()) else { return false };
+        self.interactivity = interactivity;
+        self.send_interactivity();
         self.commit();
         true
     }
@@ -554,6 +564,8 @@ impl Drop for LayerSurface {
         let backend = self.conn.backend();
         if let Some((_, cb)) = self.state.frame_callback.take() { backend.destroy_object(&cb.id()).ok(); }
         if let Some(fence) = self.state.fence.take() { backend.destroy_object(&fence.id()).ok(); }
+        self.state.release_grab();
+        if let Some(manager) = self.state.grab_manager.take() { manager.destroy(); }
         if let Some(ti) = self.state.text_input.take() { ti.destroy(); }
         if let Some(tim) = self.state.text_input_manager.take() { tim.destroy(); }
         if let Some(shape) = self.state.shape.take() { shape.destroy(); }
