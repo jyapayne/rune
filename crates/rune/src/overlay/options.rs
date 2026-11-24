@@ -234,6 +234,7 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) release_after: Option<std::time::Duration>,
     pub(crate) session_lock: Option<crate::SessionLock>,
     pub(crate) on_keyboard_state: Option<fn(&mut T, &crate::KeyboardState, &mut crate::Tx)>,
+    pub(crate) accessible_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -329,6 +330,9 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// toggled, another layout chosen), for a lock screen's or a password prompt's caps lock
     /// and layout hints. Wayland layer and lock surfaces only; elsewhere it is never called.
     pub fn on_keyboard_state(mut self, f: fn(&mut T, &crate::KeyboardState, &mut crate::Tx)) -> Self { self.on_keyboard_state = Some(f); self }
+    /// What screen readers call the overlay's window ("Launcher"), in place of its name
+    /// (`OverlaySpec::name`, the layer-shell namespace on Wayland), which they read otherwise.
+    pub fn accessible_name(mut self, name: impl Into<String>) -> Self { self.accessible_name = Some(name.into()); self }
 }
 
 /// The keyboard's lock keys and layout, as [`ConfiguredOverlay::on_keyboard_state`] hears them.
@@ -356,7 +360,7 @@ impl<T: 'static> OverlaySpec<T> {
         ConfiguredOverlay {
             spec: self, options, on_key: None, on_created: None, poll: None, compositor: None,
             setup: None, runtime: crate::app::RuntimeConfig::default(), font_smoothing: None, macos_level: None,
-            animate_reveal: false, release_after: None, session_lock: None, on_keyboard_state: None,
+            animate_reveal: false, release_after: None, session_lock: None, on_keyboard_state: None, accessible_name: None,
         }
     }
 }

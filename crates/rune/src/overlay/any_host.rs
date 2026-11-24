@@ -68,7 +68,7 @@ impl OverlayCore {
     /// action draws the frame that runs it.
     fn a11y_turn(&mut self, rt: &mut RuntimeCore) -> bool {
         let Some(adapter) = self.surface.live_mut().and_then(|l| l.a11y.as_mut()) else { return false };
-        let queued = adapter.service_core(rt, self.name);
+        let queued = adapter.service_core(rt, a11y_name(&self.accessible_name, self.name));
         if queued {
             self.dirty = true;
             self.idle = false;
@@ -450,4 +450,10 @@ impl PendingOverlay for OverlayHost {
     fn font_smoothing(&self) -> crate::FontSmoothing {
         self.app.rt().font_smoothing()
     }
+}
+
+/// What assistive clients call an overlay: its `ConfiguredOverlay::accessible_name`, or else
+/// its name (the layer-shell namespace on Wayland).
+pub(super) fn a11y_name<'a>(accessible: &'a Option<String>, name: &'static str) -> &'a str {
+    accessible.as_deref().unwrap_or(name)
 }

@@ -423,6 +423,8 @@ pub(in crate::overlay) struct OverlayCore {
     options: OverlayOptions,
     canvas_size: (f32, f32),
     name: &'static str,
+    /// `ConfiguredOverlay::accessible_name`: what assistive clients call the overlay's window.
+    accessible_name: Option<String>,
     at: Placement,
     /// Where `place_window` last put the window, to carry the pointer across a move.
     origin: Option<winit::dpi::PhysicalPosition<i32>>,
@@ -561,6 +563,7 @@ impl OverlayCore {
             slot_wake: None,
             meter,
             refollow_away: None,
+            accessible_name: None,
             lock: None,
             #[cfg(test)]
             layer_frame_pending: false,

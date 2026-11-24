@@ -138,3 +138,22 @@ fn overlay_app_forwards_release_compositor_gpu() {
     host.app.release_compositor_gpu();
     assert_eq!(releases.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn an_overlay_reads_as_its_accessible_name_or_else_its_name() {
+    fn view(_: &(), _: &mut Cx<()>) -> El { col().size(120.0, 80.0) }
+    fn root_label(configured: crate::ConfiguredOverlay<()>, app: &AppSpec<()>) -> Option<String> {
+        let (mut overlay, _) = Overlay::new(configured, (), app);
+        overlay.rt.frame(0.0);
+        let mut link = crate::AccessibilityLink::new();
+        link.activate();
+        let name = super::super::any_host::a11y_name(&overlay.core.accessible_name, overlay.core.name);
+        let update = link.service(&mut overlay.rt, name).expect("activated");
+        let root = update.tree.expect("the whole tree").root;
+        update.nodes.iter().find(|(id, _)| *id == root).and_then(|(_, node)| node.label().map(str::to_owned))
+    }
+    let app = AppSpec::new("named", (120.0, 80.0), || (), view);
+    let spec = || OverlaySpec::new("rune-launcher", app.size, view).options(Default::default());
+    assert_eq!(root_label(spec().accessible_name("Launcher"), &app).as_deref(), Some("Launcher"));
+    assert_eq!(root_label(spec(), &app).as_deref(), Some("rune-launcher"), "unnamed, it reads as its namespace");
+}

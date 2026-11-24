@@ -282,7 +282,7 @@ fn build_parts<T: 'static>(
 ) -> (OverlayCore, TypedOverlayApp<T>, bool) {
     let ConfiguredOverlay {
         spec, options, on_key, on_created, poll, compositor, setup, mut runtime, font_smoothing,
-        macos_level, animate_reveal, release_after, session_lock, on_keyboard_state,
+        macos_level, animate_reveal, release_after, session_lock, on_keyboard_state, accessible_name,
     } = configured;
     let inherits_font_smoothing = font_smoothing.is_none();
     runtime.font_smoothing = font_smoothing.unwrap_or(app.font_smoothing);
@@ -309,6 +309,7 @@ fn build_parts<T: 'static>(
         release_after,
     );
     core.lock = session_lock;
+    core.accessible_name = accessible_name;
     let typed = TypedOverlayApp { rt, compositor, setup, shared, on_keyboard_state };
     (core, typed, inherits_font_smoothing)
 }

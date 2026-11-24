@@ -1,0 +1,1 @@
+- `ConfiguredOverlay::accessible_name` sets what screen readers call an overlay's window ("Launcher"); without it they read its name, which on Wayland is the layer-shell namespace.
