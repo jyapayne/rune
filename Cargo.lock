@@ -4438,6 +4438,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "session-lock"
+version = "0.0.1"
+dependencies = [
+ "rune",
+]
+
+[[package]]
 name = "settings"
 version = "0.0.1"
 dependencies = [

@@ -74,4 +74,17 @@ impl<S: 'static> AppHandle<S> {
         self.shared.core.add_overlay(make);
         handle
     }
+
+    /// Asks the compositor to lock the session (Wayland `ext-session-lock-v1`), for a lock
+    /// screen: see [`crate::session_lock`]. The lock is sent on the event loop's next turn, or
+    /// as soon as one of its lock surfaces is made (`ConfiguredOverlay::session_lock`).
+    /// `on_change` hears each new [`LockState`](crate::LockState) on the event thread: `Locked`
+    /// once the compositor shows only lock surfaces, then `Unlocked` after
+    /// [`SessionLock::unlock`](crate::SessionLock::unlock), or `Finished` if the compositor
+    /// refuses or ends the lock, or `Unsupported`. Only `unlock` unlocks: dropping the handles
+    /// or the process ending leaves the session locked.
+    pub fn lock_session(&self, on_change: impl Fn(crate::LockState) + Send + Sync + 'static) -> crate::SessionLock {
+        let core = self.shared.core.clone();
+        crate::SessionLock::asked(on_change, move || core.wake())
+    }
 }

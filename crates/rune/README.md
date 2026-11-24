@@ -2229,6 +2229,16 @@ bar per display this way).
   as `on_focus(false)`, once, to dismiss itself; elsewhere only a lost keyboard focus does.
   Other backends treat `Exclusive` as `OnDemand`. `KeyPolicy::takes_keys()` says whether a
   policy takes keys at all.
+- Session locks (Wayland `ext-session-lock-v1`, `session_lock.rs`): `AppHandle::lock_session(
+  on_change)` asks the compositor to lock the session and returns a `SessionLock`; an overlay
+  built with `ConfiguredOverlay::session_lock(&lock)` on a display of its own is that lock's
+  surface there (sized by the compositor, given the keys, never unmapped: a hide destroys it).
+  Give every display one, including those `on_displays_changed` reports while locked.
+  `on_change` hears `Locked`, then `Unlocked` after `SessionLock::unlock`, or `Finished` when
+  the compositor refuses or ends the lock; the lock's surfaces close as it ends. Only `unlock`
+  unlocks: dropping the handles, a panic or the process ending leaves the session locked, as
+  the protocol has it. `ConfiguredOverlay::on_keyboard_state` hears Caps Lock, Num Lock and the
+  layout name on layer and lock surfaces. `examples/session-lock` locks with a passphrase.
 - Checked under headless sway (layer shell, and Xwayland for X11) and on macOS (panel level,
   bounds, hide and reshow). Windows builds are checked with `cargo xwin clippy` only.
 - `Tx::copy` works in overlays (a meeting capsule's Copy button).

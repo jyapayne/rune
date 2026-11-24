@@ -372,7 +372,7 @@ fn has_pending_events_tracks_foreign_queue_until_dispatched_and_false_when_close
         assert!(!layer.has_pending_events(), "dispatch must clear pending events");
 
         // Compositor closes the layer surface (zwlr_layer_surface_v1.closed opcode 1).
-        let layer_proto_id = layer.layer.id().protocol_id();
+        let layer_proto_id = layer.layer_objects().1.id().protocol_id();
         send_msg(&mut server_tx, layer_proto_id, 1, &[])?;
         host_read_once(&host);
         assert!(layer.has_pending_events());
@@ -574,16 +574,16 @@ fn drop_destroys_all_proxies_and_drains_queued_events_so_event_queue_does_not_le
         let cb2_proto_id = cb2_id.protocol_id();
         let surface_id = layer.surface.id();
         let surface_proto_id = surface_id.protocol_id();
-        let layer_id = layer.layer.id();
-        let shell_id = layer.shell.id();
+        let layer_id = layer.layer_objects().1.id();
+        let shell_id = layer.layer_objects().0.id();
         let compositor_id = layer.compositor.id();
         let registry_id = layer.globals.as_ref().unwrap().registry().id();
         let weaks = [
             ("registry", Arc::downgrade(layer.globals.as_ref().unwrap().registry().object_data().unwrap())),
             ("compositor", Arc::downgrade(layer.compositor.object_data().unwrap())),
-            ("shell", Arc::downgrade(layer.shell.object_data().unwrap())),
+            ("shell", Arc::downgrade(layer.layer_objects().0.object_data().unwrap())),
             ("surface", Arc::downgrade(layer.surface.object_data().unwrap())),
-            ("layer", Arc::downgrade(layer.layer.object_data().unwrap())),
+            ("layer", Arc::downgrade(layer.layer_objects().1.object_data().unwrap())),
             ("frame_callback", Arc::downgrade(cb2.object_data().unwrap())),
         ];
         drop(cb2);

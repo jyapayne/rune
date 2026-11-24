@@ -8,7 +8,7 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1};
 
 use super::super::layer_shell_machine::{exclusive_zone, frame_callback, keyboard, mapping, pointer, repeat, touch};
-use super::{LayerSurface, Over, State};
+use super::{LayerSurface, Over, Role, State};
 use crate::el::Align;
 use crate::machine::Attempt;
 use crate::overlay::{Placement, ScreenEdge};
@@ -76,21 +76,22 @@ impl State {
 
 impl LayerSurface {
     /// Sends the size, anchors, margins and exclusive zone `at` and the overlay's placement
-    /// ask for; they wait for a commit.
+    /// ask for; they wait for a commit. A lock surface is where the compositor puts it.
     pub fn place(&mut self, at: Placement) {
         self.at = at;
-        self.layer.set_exclusive_zone(exclusive_zone(self.options.placement, self.options.exclusive_zone));
+        let Role::Layer { layer, .. } = &self.role else { return };
+        layer.set_exclusive_zone(exclusive_zone(self.options.placement, self.options.exclusive_zone));
         match self.options.placement {
             Some(OverlayPlacement::FullScreen) => {
-                self.layer.set_size(0, 0);
-                self.layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-                self.layer.set_margin(0, 0, 0, 0);
+                layer.set_size(0, 0);
+                layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+                layer.set_margin(0, 0, 0, 0);
                 return;
             }
             Some(OverlayPlacement::Rect { x, y, width, height }) => {
-                self.layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
-                self.layer.set_anchor(Anchor::Top | Anchor::Left);
-                self.layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
+                layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
+                layer.set_anchor(Anchor::Top | Anchor::Left);
+                layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
                 return;
             }
             Some(OverlayPlacement::Bar { edge, thickness, margin }) => {
@@ -103,9 +104,9 @@ impl LayerSurface {
                     crate::BarEdge::Left => (Anchor::Left | Anchor::Top | Anchor::Bottom, (t, 0), (0, 0, 0, m)),
                     crate::BarEdge::Right => (Anchor::Right | Anchor::Top | Anchor::Bottom, (t, 0), (0, m, 0, 0)),
                 };
-                self.layer.set_size(size.0, size.1);
-                self.layer.set_anchor(anchor);
-                self.layer.set_margin(margins.0, margins.1, margins.2, margins.3);
+                layer.set_size(size.0, size.1);
+                layer.set_anchor(anchor);
+                layer.set_margin(margins.0, margins.1, margins.2, margins.3);
                 return;
             }
             _ => {}
@@ -124,9 +125,9 @@ impl LayerSurface {
             Align::Center => (Anchor::empty(), 0, 0),
             Align::End => (Anchor::Right, 0, inset),
         };
-        self.layer.set_size(at.size.0.ceil() as u32, at.size.1.ceil() as u32);
-        self.layer.set_anchor(vertical | horizontal);
-        self.layer.set_margin(top, right, bottom, left);
+        layer.set_size(at.size.0.ceil() as u32, at.size.1.ceil() as u32);
+        layer.set_anchor(vertical | horizontal);
+        layer.set_margin(top, right, bottom, left);
     }
 
     /// The overlay shows. A surface the last hide unmapped commits its role state again and
@@ -143,8 +144,10 @@ impl LayerSurface {
 
     /// The overlay hides and keeps the surface. A null buffer unmaps it, which puts the layer
     /// surface back in the state it was made in; the `wl_surface`, the layer surface and what
-    /// draws into them stay for the next `show`.
+    /// draws into them stay for the next `show`. A lock surface can't be unmapped (a null
+    /// buffer is a protocol error), so its overlay never keeps it: it is destroyed instead.
     pub fn hide(&mut self) {
+        if self.is_lock() { return; }
         self.ask_interactivity(keyboard::Interactivity::None);
         self.state.step_mapping(mapping::Event::Unmap);
         self.carry_out();
@@ -168,9 +171,11 @@ impl LayerSurface {
         self.send_interactivity();
     }
 
-    /// Sends the keyboard interactivity the role state asks for; it waits for a commit.
+    /// Sends the keyboard interactivity the role state asks for; it waits for a commit. A lock
+    /// surface has no such state.
     pub(super) fn send_interactivity(&self) {
-        self.layer.set_keyboard_interactivity(match self.interactivity {
+        let Role::Layer { layer, .. } = &self.role else { return };
+        layer.set_keyboard_interactivity(match self.interactivity {
             keyboard::Interactivity::None => KeyboardInteractivity::None,
             keyboard::Interactivity::OnDemand => KeyboardInteractivity::OnDemand,
             keyboard::Interactivity::Exclusive => KeyboardInteractivity::Exclusive,
@@ -184,9 +189,14 @@ impl LayerSurface {
 
     /// Commits role state (placement, keyboard interactivity, input region) without a new
     /// buffer; wgpu's present commits buffers. An unmapped surface commits nothing, since a
-    /// commit there asks for a configure: its next show sends the role state whole.
+    /// commit there asks for a configure: its next show sends the role state whole. A lock
+    /// surface commits only once a buffer maps it: a commit before that is a protocol error.
     pub fn commit(&mut self) {
-        if self.state.mapping.committed() { self.surface.commit(); }
+        let committed = match self.role {
+            Role::Layer { .. } => self.state.mapping.committed(),
+            Role::Lock { .. } => matches!(self.state.mapping, mapping::State::Mapped { .. }),
+        };
+        if committed { self.surface.commit(); }
         self.flush_checked();
     }
 
@@ -203,6 +213,12 @@ impl LayerSurface {
         let mut asked = std::mem::take(&mut self.state.asked);
         for effect in asked.drain(..) {
             match effect {
+                // A lock surface's configure comes unasked; committing it before the first ack
+                // is a protocol error. What the commit would carry waits for the first buffer.
+                mapping::Effect::Commit if self.is_lock() => {
+                    self.send_input_region();
+                    self.set_buffer_scale(self.buffer_scale);
+                }
                 mapping::Effect::Commit => {
                     self.place(self.at);
                     self.send_interactivity();
@@ -210,7 +226,10 @@ impl LayerSurface {
                     self.set_buffer_scale(self.buffer_scale);
                     self.surface.commit();
                 }
-                mapping::Effect::Ack(serial) => self.layer.ack_configure(serial),
+                mapping::Effect::Ack(serial) => match &self.role {
+                    Role::Layer { layer, .. } => layer.ack_configure(serial),
+                    Role::Lock { surface, .. } => surface.ack_configure(serial),
+                },
                 mapping::Effect::Mapped => {
                     self.state.step_keyboard_focus(keyboard::FocusEvent::Mapped);
                     self.state.grab_focus(&self.surface, &self.queue.handle());

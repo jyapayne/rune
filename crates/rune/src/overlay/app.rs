@@ -41,6 +41,9 @@ pub(super) trait OverlayApp {
     fn compositor_animating(&self) -> bool;
     fn render_compositor(&mut self, args: OverlayRenderArgs<'_>) -> bool;
     fn release_compositor_gpu(&mut self);
+    /// The keyboard's lock keys or layout changed (`ConfiguredOverlay::on_keyboard_state`);
+    /// true when the overlay's state changed.
+    fn keyboard_state(&mut self, _state: &crate::KeyboardState) -> bool { false }
 }
 
 impl dyn OverlayApp + '_ {
@@ -155,6 +158,7 @@ pub(super) struct TypedOverlayApp<T: 'static> {
     pub(super) compositor: Option<Box<dyn Compositor<T>>>,
     pub(super) setup: Option<fn(&mut T, Waker)>,
     pub(super) shared: Arc<Shared<T>>,
+    pub(super) on_keyboard_state: Option<fn(&mut T, &crate::KeyboardState, &mut Tx)>,
 }
 
 impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
@@ -218,6 +222,14 @@ impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
             c.release_gpu();
         }
     }
+
+    fn keyboard_state(&mut self, state: &crate::KeyboardState) -> bool {
+        let Some(f) = self.on_keyboard_state else { return false };
+        self.rt.update_if(|s, tx| {
+            f(s, state, tx);
+            true
+        })
+    }
 }
 
 /// Non-generic overlay host stored in `App::overlays` and `Windows::hosts`.
@@ -270,7 +282,7 @@ fn build_parts<T: 'static>(
 ) -> (OverlayCore, TypedOverlayApp<T>, bool) {
     let ConfiguredOverlay {
         spec, options, on_key, on_created, poll, compositor, setup, mut runtime, font_smoothing,
-        macos_level, animate_reveal, release_after,
+        macos_level, animate_reveal, release_after, session_lock, on_keyboard_state,
     } = configured;
     let inherits_font_smoothing = font_smoothing.is_none();
     runtime.font_smoothing = font_smoothing.unwrap_or(app.font_smoothing);
@@ -284,7 +296,7 @@ fn build_parts<T: 'static>(
     rt.poll = poll.or_else(|| app.poll.and_then(|f| f.downcast_ref::<fn(&mut T, f64, &mut Tx) -> bool>().copied()));
     rt.set_live_visible(false);
     let at = Placement { size: spec.size, edge: spec.edge, margin: spec.margin, align: spec.align, inset: spec.inset };
-    let core = OverlayCore::new(
+    let mut core = OverlayCore::new(
         rt.core_mut(),
         shared.core.clone(),
         spec.name,
@@ -296,7 +308,8 @@ fn build_parts<T: 'static>(
         animate_reveal,
         release_after,
     );
-    let typed = TypedOverlayApp { rt, compositor, setup, shared };
+    core.lock = session_lock;
+    let typed = TypedOverlayApp { rt, compositor, setup, shared, on_keyboard_state };
     (core, typed, inherits_font_smoothing)
 }
 
@@ -426,7 +439,7 @@ macro_rules! with_app {
 impl<T: 'static> Overlay<T> {
     pub(super) fn new<S>(configured: impl Into<ConfiguredOverlay<T>>, state: T, app: &AppSpec<S>) -> (Self, OverlayHandle<T>) {
         let (core, typed, _) = build_parts(configured.into(), state, AppParts::of(app, crate::FontSmoothing::default()), Arc::new(Shared::default()));
-        let TypedOverlayApp { rt, compositor, setup, shared } = typed;
+        let TypedOverlayApp { rt, compositor, setup, shared, .. } = typed;
         let handle = OverlayHandle { shared: shared.clone() };
         (Overlay { core, rt, compositor, setup, shared }, handle)
     }

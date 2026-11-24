@@ -483,6 +483,8 @@ impl ApplicationHandler<WakeEvent> for Windows {
         crate::cursor::os::make_pending(event_loop);
         // Before the hosts draw, so an overlay added for a new display draws this turn.
         self.displays_turn(event_loop);
+        // Before the hosts, so a lock's surfaces close in the turn its lock ends.
+        let locks = crate::session_lock::turn_loop(event_loop);
         let mut animating = false;
         for host in self.hosts.iter_mut().flatten() {
             animating |= host.about_to_wait(event_loop);
@@ -491,7 +493,7 @@ impl ApplicationHandler<WakeEvent> for Windows {
         // putting off behind another window's.
         let now = crate::time::now();
         for host in self.hosts.iter_mut().flatten() { host.turn_ends(event_loop, now); }
-        let effects = wayland_wake::about_to_wait(&mut self.wayland_wake, &self.hosts, self.displays.watching(), self.displays.pending());
+        let effects = wayland_wake::about_to_wait(&mut self.wayland_wake, &self.hosts, self.displays.watching() || locks.live, self.displays.pending() || locks.pending);
         self.apply_wayland_wake(event_loop, effects);
         // Layer surfaces have no redraw events: keep turning while one animates (its vsync
         // paces the loop). Hosts whose only motion is an ambient loop sleep until its next step.

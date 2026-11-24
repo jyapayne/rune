@@ -232,6 +232,8 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) macos_level: Option<isize>,
     pub(crate) animate_reveal: bool,
     pub(crate) release_after: Option<std::time::Duration>,
+    pub(crate) session_lock: Option<crate::SessionLock>,
+    pub(crate) on_keyboard_state: Option<fn(&mut T, &crate::KeyboardState, &mut crate::Tx)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,6 +309,42 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// `OverlayOptions::level`; `OverlayHandle::set_macos_level` changes it later. At any
     /// level a macOS overlay goes exactly where it's placed, over the menu bar too.
     pub fn macos_level(mut self, level: isize) -> Self { self.macos_level = Some(level); self }
+    /// Makes the overlay a lock surface of `lock` (Wayland `ext-session-lock-v1`) on the display
+    /// `OverlayOptions::display` names, which must be one of its own (`DisplayTarget::Id`, or
+    /// `Native` with a Wayland id). The compositor sizes it to that display and sends it the
+    /// keys while the display has the focus; placement, layer and reserved zones don't apply,
+    /// and its keys are [`KeyPolicy::Exclusive`]. Showing it makes the lock surface (and sends
+    /// the lock, if the event loop hasn't yet); it is never prewarmed. A hide destroys the lock
+    /// surface, which leaves the session locked; the lock's end (an unlock, or the compositor's
+    /// `finished`) closes it, and the overlay hides and is `Unavailable` (remove it). Elsewhere
+    /// than Wayland it never shows.
+    pub fn session_lock(mut self, lock: &crate::SessionLock) -> Self {
+        self.session_lock = Some(lock.clone());
+        self.options.keys = KeyPolicy::Exclusive;
+        self.options.prewarm = false;
+        self
+    }
+    /// Hears the keyboard's lock keys and layout as the compositor reports them to this
+    /// overlay: once when its surface gets the keyboard, then on each change (Caps Lock
+    /// toggled, another layout chosen), for a lock screen's or a password prompt's caps lock
+    /// and layout hints. Wayland layer and lock surfaces only; elsewhere it is never called.
+    pub fn on_keyboard_state(mut self, f: fn(&mut T, &crate::KeyboardState, &mut crate::Tx)) -> Self { self.on_keyboard_state = Some(f); self }
+}
+
+/// The keyboard's lock keys and layout, as [`ConfiguredOverlay::on_keyboard_state`] hears them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyboardState {
+    pub caps_lock: bool,
+    pub num_lock: bool,
+    /// The active layout's name in the keymap (`English (US)`), when it has one.
+    pub layout: Option<String>,
+}
+
+impl KeyboardState {
+    pub fn new(caps_lock: bool, num_lock: bool, layout: Option<String>) -> Self {
+        KeyboardState { caps_lock, num_lock, layout }
+    }
 }
 
 impl<T: 'static> OverlaySpec<T> {
@@ -318,7 +356,7 @@ impl<T: 'static> OverlaySpec<T> {
         ConfiguredOverlay {
             spec: self, options, on_key: None, on_created: None, poll: None, compositor: None,
             setup: None, runtime: crate::app::RuntimeConfig::default(), font_smoothing: None, macos_level: None,
-            animate_reveal: false, release_after: None,
+            animate_reveal: false, release_after: None, session_lock: None, on_keyboard_state: None,
         }
     }
 }

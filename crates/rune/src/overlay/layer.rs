@@ -66,11 +66,18 @@ impl OverlayCore {
 
     /// The layer surface can't show again: the overlay hides, the surface goes whether or not
     /// a hide would keep it, and the overlay is `Unavailable` until a later show makes a new
-    /// one. One the compositor never configured says so.
+    /// one. One the compositor never configured says so, and so does a lock surface whose lock
+    /// ended.
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     fn surface_gone(&mut self, app: &mut dyn OverlayApp, gone: crate::platform::layer_shell::Gone) {
         use crate::platform::layer_shell::Gone;
         match gone {
+            Gone::Closed if self.lock.as_ref().is_some_and(|lock| lock.state().ended()) => {
+                self.hide(app);
+                self.drop_surface(app);
+                *self.shared.failure.lock().unwrap() = Some("its session lock has ended".into());
+                self.set_availability(Availability::Unavailable);
+            }
             Gone::Closed => self.surface_closed(app),
             Gone::Unanswered => self.surface_refused(app, "the compositor did not configure its surface".into()),
         }
@@ -78,9 +85,9 @@ impl OverlayCore {
 
     /// A prewarmed layer surface that keeps its GPU stays through a hide, as a prewarmed window
     /// does elsewhere: unmapped, so the next show makes no `wl_surface`, layer surface or
-    /// swapchain, and waits for nothing on the UI thread.
+    /// swapchain, and waits for nothing on the UI thread. A lock surface can't be unmapped.
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-    fn keeps_layer(&self) -> bool { self.options.prewarm && !self.defers_gpu() }
+    fn keeps_layer(&self) -> bool { self.options.prewarm && !self.defers_gpu() && self.lock.is_none() }
 
     /// The overlay hid: a layer surface it keeps is unmapped; any other layer or XWayland
     /// surface is destroyed.
@@ -167,6 +174,10 @@ impl OverlayCore {
                 deliver_layer_ime(app.rt_mut(), &mut self.ime, ime);
             }
             Input::Ime(_) => return,
+            Input::Keyboard(state) => {
+                self.dirty |= app.keyboard_state(&state);
+                return;
+            }
         }
         self.dirty = true;
     }

@@ -2,6 +2,10 @@
 //! connection, in a private event queue with its own seat. The surface reserves no space;
 //! input regions and the rendered buffer share a commit. Global pointer observation and
 //! capture exclusion are unavailable. wgpu draws through the raw `wl_surface`.
+//!
+//! The same surface can instead be a session lock's lock surface (`ext_session_lock_surface_v1`,
+//! [`Role::Lock`]): sized by the compositor to its output, never unmapped, and given up for
+//! good when its lock ends (`lock_role`).
 
 use std::ptr::NonNull;
 
@@ -31,6 +35,7 @@ mod compose;
 mod dead;
 mod focus_grab;
 mod keys;
+mod lock_role;
 mod map;
 mod pointing;
 mod text_input;
@@ -47,6 +52,8 @@ pub(crate) enum Input {
     Focus(bool), Key(crate::KeyEvent), KeyRepeat(crate::KeyEvent), KeyUp(crate::KeyEvent),
     Physical(crate::PhysicalInput, Option<crate::KeyEvent>),
     Ime(crate::Ime),
+    /// The keyboard's lock keys or layout changed (or the surface just got the keyboard).
+    Keyboard(crate::KeyboardState),
 }
 
 #[derive(Default)]
@@ -85,6 +92,8 @@ struct State {
     keyboard: Option<WlKeyboard>,
     xkb: Option<xkbcommon::xkb::State>,
     compose: compose::Slot,
+    /// The lock keys and layout last reported, so only a change is.
+    keyboard_state: Option<crate::KeyboardState>,
     mod_state: Option<keyboard::ModState>,
     repeat_seq: crate::machine::Seq,
     repeat: repeat::State,
@@ -195,6 +204,20 @@ pub(crate) struct Changes {
     pub gone: Option<Gone>,
 }
 
+/// What the surface is to the compositor.
+enum Role {
+    /// A layer-shell surface: placed, sized and given the keys as its overlay asks.
+    Layer { shell: ZwlrLayerShellV1, layer: ZwlrLayerSurfaceV1 },
+    /// A session lock's surface on one output: the compositor sizes it and gives it the keys.
+    Lock { surface: lock_role::ExtSessionLockSurfaceV1, lock: crate::SessionLock },
+}
+
+/// The role a new surface asks for.
+pub(crate) enum Ask<'a> {
+    Layer,
+    Lock(&'a crate::SessionLock),
+}
+
 pub(crate) struct LayerSurface {
     namespace: String,
     conn: Connection,
@@ -202,13 +225,12 @@ pub(crate) struct LayerSurface {
     seat_global: Option<(u32, u32)>,
     regions: std::cell::RefCell<Option<Vec<[i32; 4]>>>,
     compositor: WlCompositor,
-    shell: ZwlrLayerShellV1,
+    role: Role,
     output: Option<WlOutput>,
     seat: Option<WlSeat>,
     options: OverlayOptions,
     queue: EventQueue<State>,
     state: State,
-    layer: ZwlrLayerSurfaceV1,
     surface: WlSurface,
     /// Where the role state last put the surface, for the commit that maps it again.
     at: Placement,
@@ -254,10 +276,27 @@ impl LayerSurface {
     /// None when the display isn't Wayland or the compositor lacks layer-shell. The role state
     /// is committed and the compositor's first `configure` asked for, not waited for: a later
     /// `dispatch` acks it, and `frame_ready` says when a frame may draw.
-    #[allow(unsafe_code)]
+    #[cfg(test)]
     pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>) -> Option<LayerSurface> {
+        Self::make(display, namespace, at, interactive, options, output_id, Ask::Layer)
+    }
+
+    /// The layer-shell objects of a layer surface, for tests that send their events.
+    #[cfg(test)]
+    fn layer_objects(&self) -> (&ZwlrLayerShellV1, &ZwlrLayerSurfaceV1) {
+        match &self.role {
+            Role::Layer { shell, layer } => (shell, layer),
+            Role::Lock { .. } => panic!("a lock surface has no layer-shell objects"),
+        }
+    }
+
+    /// `new` with the role `ask` names. A lock surface needs its output (`output_id`) and a
+    /// lock that hasn't ended; the compositor configures it unasked.
+    #[allow(unsafe_code)]
+    pub fn make(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>, ask: Ask<'_>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
-        let want_keys = options.keys.takes_keys();
+        // A lock surface is the one place the keys can go while the session is locked.
+        let want_keys = options.keys.takes_keys() || matches!(ask, Ask::Lock(_));
         if want_keys { compose::warm(); }
         // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
         // every overlay; a foreign backend never closes it.
@@ -273,31 +312,55 @@ impl LayerSurface {
             }
         };
         let qh = queue.handle();
-        let Ok(compositor) = globals.bind::<WlCompositor, _, _>(&qh, 1..=6, ()) else {
-            destroy_globals(&conn, globals);
-            drain_event_queue(&mut queue, &mut State::default());
+        let give_up = |conn: &Connection, globals: GlobalList, queue: &mut EventQueue<State>, made: &[wayland_backend::client::ObjectId]| {
+            for id in made { conn.backend().destroy_object(id).ok(); }
+            destroy_globals(conn, globals);
+            drain_event_queue(queue, &mut State::default());
             queue.flush().ok();
+        };
+        let Ok(compositor) = globals.bind::<WlCompositor, _, _>(&qh, 1..=6, ()) else {
+            give_up(&conn, globals, &mut queue, &[]);
             return None;
         };
-        let Ok(shell) = globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ()) else {
-            conn.backend().destroy_object(&compositor.id()).ok();
-            destroy_globals(&conn, globals);
-            drain_event_queue(&mut queue, &mut State::default());
-            queue.flush().ok();
-            return None;
+        let shell = match ask {
+            Ask::Layer => match globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ()) {
+                Ok(shell) => Some(shell),
+                Err(_) => {
+                    give_up(&conn, globals, &mut queue, &[compositor.id()]);
+                    return None;
+                }
+            },
+            Ask::Lock(_) => None,
         };
         let output = output_id.and_then(|id| {
             globals.contents().with_list(|list| list.iter().find(|g| g.name == id && g.interface == "wl_output").map(|g| {
                 globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())
             }))
         });
+        let surface = compositor.create_surface(&qh, ());
+        let role = match (ask, shell) {
+            (Ask::Lock(lock), _) => match lock_role::lock_surface(&conn, &qh, lock, &surface, output.as_ref(), display.display) {
+                Ok(lock_surface) => Role::Lock { surface: lock_surface, lock: lock.clone() },
+                Err(why) => {
+                    eprintln!("rune: Wayland lock surface '{namespace}' not made: {why}");
+                    surface.destroy();
+                    let mut made = vec![compositor.id()];
+                    made.extend(output.as_ref().map(Proxy::id));
+                    give_up(&conn, globals, &mut queue, &made);
+                    return None;
+                }
+            },
+            // There is no layer above Overlay; relative ordering of peers on one layer is
+            // compositor policy, unlike AppKit's numeric levels.
+            (Ask::Layer, shell) => {
+                let shell = shell?;
+                let layer = shell.get_layer_surface(&surface, output.as_ref(), wire_layer(options.wayland_layer), namespace.to_owned(), &qh, ());
+                Role::Layer { shell, layer }
+            }
+        };
         let want_pointer = options.input.resolved(interactive) != OverlayInput::None;
         let seat_global = globals.contents().with_list(|list| list.iter().find(|g| g.interface == "wl_seat").map(|g| (g.name, g.version.min(8))));
         let seat = if want_pointer || want_keys { seat_global.map(|(name, version)| globals.registry().bind::<WlSeat, _, _>(name, version, &qh, ())) } else { None };
-        let surface = compositor.create_surface(&qh, ());
-        // There is no layer above Overlay; relative ordering of peers on one layer is
-        // compositor policy, unlike AppKit's numeric levels.
-        let layer = shell.get_layer_surface(&surface, output.as_ref(), wire_layer(options.wayland_layer), namespace.to_owned(), &qh, ());
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
         let text_input_manager = want_keys
             .then(|| globals.bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ()).ok())
@@ -306,7 +369,8 @@ impl LayerSurface {
             .as_ref()
             .zip(seat.as_ref())
             .map(|(manager, seat)| manager.get_text_input(seat, &qh, ()));
-        let grab_manager = (keyboard::shown_interactivity(options.keys) == keyboard::Interactivity::Exclusive)
+        // A lock surface needs no grab: nothing else takes input while the session is locked.
+        let grab_manager = (matches!(role, Role::Layer { .. }) && keyboard::shown_interactivity(options.keys) == keyboard::Interactivity::Exclusive)
             .then(|| globals.bind::<focus_grab::HyprlandFocusGrabManagerV1, _, _>(&qh, 1..=1, ()).ok())
             .flatten();
         let state = State {
@@ -323,7 +387,7 @@ impl LayerSurface {
             namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global,
             // Takes no input until the first frame publishes its hit regions.
             regions: std::cell::RefCell::new(Some(Vec::new())),
-            compositor, shell, output, seat, options: options.clone(), queue, state, layer, surface,
+            compositor, role, output, seat, options: options.clone(), queue, state, surface,
             at, interactivity: keyboard::Interactivity::None, buffer_scale: 1, display: display.display,
         };
         this.state.step_mapping(mapping::Event::Map { now: crate::time::now() });
@@ -331,6 +395,11 @@ impl LayerSurface {
         this.flush_checked();
         if !this.is_live() { return None; }
         Some(this)
+    }
+
+    /// Whether this is a session lock's surface.
+    pub fn is_lock(&self) -> bool {
+        matches!(self.role, Role::Lock { .. })
     }
 
     pub fn set_placement(&mut self, placement: Option<OverlayPlacement>) {
@@ -384,9 +453,11 @@ impl LayerSurface {
     }
 
     /// Asks the compositor for the keys; false when the policy or the layer-shell version
-    /// can't. The surface keeps asking until it hides.
+    /// can't. The surface keeps asking until it hides. A lock surface has them whenever its
+    /// output has the focus, unasked.
     pub fn request_keys(&mut self) -> bool {
-        let Some(interactivity) = keyboard::requested_interactivity(self.options.keys, self.layer.version()) else { return false };
+        let Role::Layer { layer, .. } = &self.role else { return true };
+        let Some(interactivity) = keyboard::requested_interactivity(self.options.keys, layer.version()) else { return false };
         self.interactivity = interactivity;
         self.send_interactivity();
         self.commit();
@@ -394,7 +465,10 @@ impl LayerSurface {
     }
 
     pub fn supports_keys(&self) -> bool {
-        keyboard::supports_keys(self.options.keys, self.layer.version(), self.seat.is_some())
+        match &self.role {
+            Role::Layer { layer, .. } => keyboard::supports_keys(self.options.keys, layer.version(), self.seat.is_some()),
+            Role::Lock { .. } => self.seat.is_some(),
+        }
     }
 
     pub fn has_keyboard_focus(&self) -> bool {
@@ -503,9 +577,17 @@ impl LayerSurface {
     }
 
     /// Dispatches what winit read for the surface, lets a configure deadline pass, and sends
-    /// what either asked for.
+    /// what either asked for. A lock surface whose lock ended closes: the compositor uses it no
+    /// more, and the protocol asks the client to destroy it.
     fn turn(&mut self) {
         if !self.is_live() { return; }
+        if let Role::Lock { lock, .. } = &self.role && lock.state().ended() {
+            self.state.step_mapping(mapping::Event::Closed);
+            self.state.drop_frame_callback(&self.conn);
+            self.state.step_repeat(repeat::Event::Stop);
+            self.state.input.clear();
+            return;
+        }
         let waiting = self.state.mapping.attempt();
         let dispatch_err = self.queue.dispatch_pending(&mut self.state).err();
         // After the dispatch: a configure it just read disarms the deadline.
@@ -587,12 +669,18 @@ impl Drop for LayerSurface {
         if let Some(seat) = self.seat.take() {
             if seat.version() >= 5 { seat.release(); } else { backend.destroy_object(&seat.id()).ok(); }
         }
+        // The role goes before the output it names and the surface it gives a role to.
+        match &self.role {
+            Role::Layer { layer, .. } => layer.destroy(),
+            Role::Lock { surface, .. } => surface.destroy(),
+        }
         if let Some(output) = self.output.take() {
             if output.version() >= 3 { output.release(); } else { backend.destroy_object(&output.id()).ok(); }
         }
-        self.layer.destroy();
         self.surface.destroy();
-        if self.shell.version() >= 3 { self.shell.destroy(); } else { backend.destroy_object(&self.shell.id()).ok(); }
+        if let Role::Layer { shell, .. } = &self.role {
+            if shell.version() >= 3 { shell.destroy(); } else { backend.destroy_object(&shell.id()).ok(); }
+        }
         backend.destroy_object(&self.compositor.id()).ok();
         if let Some(globals) = self.globals.take() {
             destroy_globals(&self.conn, globals);

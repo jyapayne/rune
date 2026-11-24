@@ -480,6 +480,8 @@ pub(in crate::overlay) struct OverlayCore {
     meter: crate::frame::surface_stats::SurfaceMeter,
     /// The display `refollow_pointer` last found the pointer on, away from the overlay's.
     refollow_away: Option<winit::monitor::MonitorHandle>,
+    /// `ConfiguredOverlay::session_lock`: the lock this overlay is a lock surface of.
+    lock: Option<crate::SessionLock>,
     /// Test hook mirroring an outstanding Wayland `wl_surface.frame` callback on all hosts.
     #[cfg(test)]
     layer_frame_pending: bool,
@@ -559,6 +561,7 @@ impl OverlayCore {
             slot_wake: None,
             meter,
             refollow_away: None,
+            lock: None,
             #[cfg(test)]
             layer_frame_pending: false,
         }

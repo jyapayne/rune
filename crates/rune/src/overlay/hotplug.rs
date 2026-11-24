@@ -133,6 +133,13 @@ impl OverlayCore {
                 None
             }
             Some(live) => Some(live),
+            // A lock surface is a lock surface or nothing.
+            None if self.lock.is_some() => {
+                if self.shared.failure.lock().unwrap().is_none() {
+                    self.fail("the compositor could not make its lock surface: the lock has ended or was refused".into());
+                }
+                None
+            }
             None => self.xwayland(app),
         }
     }

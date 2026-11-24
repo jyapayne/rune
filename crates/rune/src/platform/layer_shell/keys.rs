@@ -47,6 +47,28 @@ impl State {
             }
         }
     }
+
+    /// Reports the lock keys and layout once the surface has the keyboard, when they differ
+    /// from what it reported last.
+    fn report_keyboard_state(&mut self) {
+        let Some(xkb) = &self.xkb else { return };
+        if !self.keyboard_focus.focused() { return; }
+        let now = keyboard_state(xkb);
+        if self.keyboard_state.as_ref() != Some(&now) {
+            self.keyboard_state = Some(now.clone());
+            self.input.push(Input::Keyboard(now));
+        }
+    }
+}
+
+/// Caps Lock, Num Lock and the effective layout's name, from an XKB state.
+pub(super) fn keyboard_state(state: &xkbcommon::xkb::State) -> crate::KeyboardState {
+    use xkbcommon::xkb;
+    let locked = |name: &str| state.mod_name_is_active(name, xkb::STATE_MODS_LOCKED);
+    let index = state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+    let keymap = state.get_keymap();
+    let name = keymap.layout_get_name(index);
+    crate::KeyboardState::new(locked(xkb::MOD_NAME_CAPS), locked(xkb::MOD_NAME_NUM), (!name.is_empty()).then(|| name.to_owned()))
 }
 
 impl Dispatch<WlKeyboard, ()> for State {
@@ -61,6 +83,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                 } else {
                     keyboard::FocusEvent::EnterOther
                 };
+                // The lock keys are reported with the `modifiers` event that follows an enter.
                 state.step_keyboard_focus(focus_event);
             }
             wl_keyboard::Event::Leave { surface, .. } if state.surface.as_ref() == Some(&surface) => {
@@ -84,6 +107,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                     {
                         state.step_repeat(repeat::Event::Stop);
                     }
+                    state.report_keyboard_state();
                 }
             }
             wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
@@ -92,6 +116,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                     xkb.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                     state.input.push(Input::Physical(crate::PhysicalInput::Modifiers(key_mods(xkb)), None));
                 }
+                state.report_keyboard_state();
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.step_repeat(repeat::Event::RepeatInfo { rate, delay_ms: delay });

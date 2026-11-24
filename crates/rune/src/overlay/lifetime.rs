@@ -76,6 +76,11 @@ impl OverlayCore {
     /// wait for the show.
     pub(super) fn prepare(&mut self, app: &mut dyn OverlayApp, event_loop: &ActiveEventLoop, showing: bool) {
         if self.surface.live().is_some() { return; }
+        // A lock surface is made only to show (making it sends the lock), and only on Wayland.
+        if self.lock.is_some() && !showing { return; }
+        if self.lock.is_some() && !crate::window::is_wayland(event_loop) {
+            return self.fail("a session lock needs Wayland's ext-session-lock-v1".into());
+        }
         let surface = showing || !self.defers_gpu();
         let wayland = crate::window::is_wayland(event_loop);
         // Only an X11 window waits parked for its surface. A Wayland overlay's window is its
@@ -275,7 +280,11 @@ impl OverlayCore {
             DisplayTarget::Native(crate::NativeDisplayId::Wayland(id)) if event_loop.available_monitors().any(|m| m.native_id() == *id) => Some(*id),
             _ => None,
         };
-        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, output)?;
+        let ask = match &self.lock {
+            Some(lock) => crate::platform::layer_shell::Ask::Lock(lock),
+            None => crate::platform::layer_shell::Ask::Layer,
+        };
+        let mut layer = crate::platform::layer_shell::LayerSurface::make(display, self.name, self.at, self.interactive, &self.options, output, ask)?;
         layer.set_buffer_scale(scale);
         self.shared.native.lock().unwrap().1 = crate::OverlayCapabilities {
             capture_exclusion: OverlaySupport::Unsupported, global_pointer: OverlaySupport::Unsupported,
