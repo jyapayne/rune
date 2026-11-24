@@ -107,13 +107,18 @@ pub(crate) fn step(state: &mut State, event: Event) -> Effects<Effect> {
     }
 }
 
-/// Evaluates all hosts at the end of `Windows::about_to_wait` and steps `state`.
+/// Evaluates all hosts at the end of `Windows::about_to_wait` and steps `state`. `watching`
+/// says the output watcher (`window::displays`) listens on the same connection, which keeps
+/// winit waking on reads as a live layer surface does, and `watch_pending` that a read this
+/// turn already queued events for it.
 pub(crate) fn about_to_wait(
     state: &mut State,
     hosts: &[Option<Box<dyn AnyHost>>],
+    watching: bool,
+    watch_pending: bool,
 ) -> Effects<Effect> {
-    let has_live_layer = hosts.iter().flatten().any(|h| h.has_live_wayland_layer());
-    let has_pending_events = hosts.iter().flatten().any(|h| h.has_pending_platform_events());
+    let has_live_layer = watching || hosts.iter().flatten().any(|h| h.has_live_wayland_layer());
+    let has_pending_events = watch_pending || hosts.iter().flatten().any(|h| h.has_pending_platform_events());
     step(state, Event::AboutToWait { has_live_layer, has_pending_events })
 }
 

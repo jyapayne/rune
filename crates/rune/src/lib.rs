@@ -196,6 +196,7 @@ pub use open_url::OpenUrlError;
 pub use open_url::instance::release_instance;
 pub use open_url::instance::single_instance;
 pub use overlay::Availability;
+pub use overlay::DisplaysCx;
 pub use overlay::OverlayHandle;
 pub use overlay::OverlaySpec;
 pub use overlay::ScreenEdge;

@@ -64,13 +64,14 @@ impl OverlayCore {
         let _ = app;
     }
 
-    /// The layer surface can't show again: the overlay hides and the surface goes, so the next
-    /// show makes a new one. One the compositor never configured says so.
+    /// The layer surface can't show again: the overlay hides, the surface goes whether or not
+    /// a hide would keep it, and the overlay is `Unavailable` until a later show makes a new
+    /// one. One the compositor never configured says so.
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     fn surface_gone(&mut self, app: &mut dyn OverlayApp, gone: crate::platform::layer_shell::Gone) {
         use crate::platform::layer_shell::Gone;
         match gone {
-            Gone::Closed => self.hide(app),
+            Gone::Closed => self.surface_closed(app),
             Gone::Unanswered => self.surface_refused(app, "the compositor did not configure its surface".into()),
         }
     }

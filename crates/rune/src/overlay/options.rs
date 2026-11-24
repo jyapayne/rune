@@ -43,8 +43,12 @@ pub enum DisplayTarget {
     #[default]
     Primary,
     UnderPointer,
+    /// One display, from `Display::id`. Once it's disconnected the overlay falls back to the
+    /// primary, except on Wayland, where it can't show (`Availability::Unavailable`) rather
+    /// than land beside what another display already shows.
     Id(DisplayId),
-    /// Resolve a native capture/display ID; disconnected IDs fall back to primary.
+    /// Resolve a native capture/display ID; disconnected IDs fall back to primary, except a
+    /// Wayland one, as for `Id`.
     Native(NativeDisplayId),
 }
 

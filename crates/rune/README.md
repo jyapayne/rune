@@ -2192,6 +2192,16 @@ of the primary display, centred or `inset` points from a side. Clicks pass throu
 `Unavailable` where the platform can't do it. An overlay is one more host on the event loop
 (it shares the GPU pool) but never keeps the loop alive alone.
 
+Overlays can come and go while the app runs. `App::on_displays_changed(|displays, cx| ..)`
+hears the displays at startup and, on Wayland, each time one is plugged in, unplugged or
+changes mode, scale or position (`Display::name` is the connector's, such as `DP-2`); it runs
+with no window and no overlay too. Its `cx.overlay(spec, state)` adds an overlay like
+`App::overlay`, `AppHandle::add_overlay(|| spec, state)` does from any thread, and
+`OverlayHandle::remove()` takes one away for good, with its surface, renderer and state. A
+Wayland overlay on a display of its own (`DisplayTarget::Id`) whose display goes doesn't move
+to another: it hides and reports `Unavailable` until removed (`examples/layer-bar` keeps one
+bar per display this way).
+
 - Wayland: a `zwlr_layer_shell_v1` surface on winit's display (overlay layer, exclusive zone 0),
   supporting pointer and touch input, `KeyPolicy::OnDemand` keyboard interactivity (layer-shell v4),
   and per-monitor `wl_output` placement, with buffer scale from `preferred_buffer_scale`. Hidden

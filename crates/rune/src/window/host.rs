@@ -228,6 +228,7 @@ impl Host {
     ) -> Self {
         let WindowSpec { mut app, options, key, on_created } = window_spec;
         let args = app.resolve_args(args);
+        cx.links.push((cx.slot, app.overlay_link()));
         let (prepared, native_handle, slot, gpu_pool, wayland) =
             HostWaker::prepare(&key, handle, &mut app.overlays, cx, app.standard_menus);
         let (on_window, on_ready, on_frame_encoded, on_frame_drawn) = (

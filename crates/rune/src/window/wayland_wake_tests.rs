@@ -96,7 +96,7 @@ impl Harness {
     }
 
     fn end_turn(&mut self, hosts: &[Option<Box<dyn AnyHost>>]) {
-        let effects = about_to_wait(&mut self.state, hosts);
+        let effects = about_to_wait(&mut self.state, hosts, false, false);
         self.apply(effects);
     }
 }

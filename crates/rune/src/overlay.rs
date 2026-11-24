@@ -51,6 +51,9 @@ mod draw;
 #[path = "overlay/frame.rs"]
 mod frame;
 use frame::{OverlayRenderArgs, idle_after, render_frame, step};
+mod hotplug;
+pub use hotplug::DisplaysCx;
+pub(crate) use hotplug::{AppLink, Deferred, OnDisplays, deferred};
 #[path = "overlay/input.rs"]
 mod input;
 pub(crate) mod keys;
@@ -74,7 +77,7 @@ mod surface;
 #[path = "overlay/xwayland.rs"]
 pub(crate) mod xwayland;
 
-pub(crate) use app::OverlayHost;
+pub(crate) use app::{AppSeed, OverlayHost};
 use app::OverlayApp;
 #[cfg(test)]
 use crate::compose::{Compositor, Frame};
@@ -115,6 +118,8 @@ pub enum Availability {
     Unknown,
     Available,
     /// Wayland without layer-shell, or its window, surface or show failed (`OverlayHandle::failure`).
+    /// Also a Wayland overlay on a display of its own (`DisplayTarget::Id`) once that display is
+    /// gone, and any overlay after `OverlayHandle::remove`.
     Unavailable,
 }
 
@@ -142,6 +147,8 @@ pub(in crate::overlay) struct SharedCore {
     pub(in crate::overlay) wake: Mutex<Option<Waker>>,
     /// What the overlay's meter last published.
     pub(in crate::overlay) stats: Arc<Mutex<crate::SurfaceStats>>,
+    /// `OverlayHandle::remove` was called: the host goes on its next turn and hears nothing more.
+    pub(in crate::overlay) removed: std::sync::atomic::AtomicBool,
 }
 
 impl SharedCore {
@@ -153,6 +160,7 @@ impl SharedCore {
     }
 
     fn request(&self, f: impl FnOnce(&mut Requests)) {
+        if self.removed() { return; }
         f(&mut self.requests.lock().unwrap());
         self.wake();
     }
@@ -199,7 +207,6 @@ pub(in crate::overlay) struct Shared<T> {
     pub(in crate::overlay) updates: Mutex<Vec<Update<T>>>,
 }
 
-#[cfg(test)]
 impl<T> Default for Shared<T> {
     fn default() -> Self {
         Self { core: Arc::default(), updates: Mutex::default() }
@@ -326,6 +333,7 @@ impl<T: 'static> OverlayHandle<T> {
     /// Returning false after changing state the view reads leaves the screen stale until the
     /// next change.
     pub fn update_if(&self, f: impl FnOnce(&mut T, &mut Tx) -> bool + Send + 'static) {
+        if self.shared.core.removed() { return; }
         self.shared.updates.lock().unwrap().push(Box::new(f));
         self.shared.core.wake();
     }
