@@ -47,7 +47,8 @@ impl Requests {
 
 impl OverlayCore {
     /// Keeps the window out of screen recordings, or lets recorders see it again. A window
-    /// made later (Wayland recreates on hide) starts from the same option.
+    /// made later (a Wayland overlay that isn't prewarmed is made for each show) starts from
+    /// the same option.
     pub(super) fn set_capture_exclusion(&mut self, exclude: bool) {
         self.options.exclude_from_capture = exclude;
         #[cfg(target_os = "macos")]

@@ -5,7 +5,8 @@
 //! full-display/rect placement, regional input and explicit nonactivating keyboard policy.
 //!
 //! - Wayland: layer-shell (`layer_shell.rs`) with output-local input regions and a private
-//!   seat queue. Hidden means destroyed. No global pointer observation or capture exclusion.
+//!   seat queue. Hidden means destroyed, or for a prewarmed overlay unmapped and kept for the
+//!   next show. No global pointer observation or capture exclusion.
 //!   Without layer-shell (GNOME), an overlay that takes no input shows on XWayland instead
 //!   (`x11/xwayland.rs`): an override-redirect ARGB window with an empty input shape. One that
 //!   takes the pointer does too when its host opts in (`OverlayOptions::xwayland_input`).

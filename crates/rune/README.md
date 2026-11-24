@@ -2194,8 +2194,11 @@ of the primary display, centred or `inset` points from a side. Clicks pass throu
 
 - Wayland: a `zwlr_layer_shell_v1` surface on winit's display (overlay layer, exclusive zone 0),
   supporting pointer and touch input, `KeyPolicy::OnDemand` keyboard interactivity (layer-shell v4),
-  and per-monitor `wl_output` placement, with buffer scale from `preferred_buffer_scale`; hidden
-  means destroyed.
+  and per-monitor `wl_output` placement, with buffer scale from `preferred_buffer_scale`. Hidden
+  means destroyed, except a `prewarm` overlay: its hide unmaps the surface (a null buffer) and
+  its next show maps it again on the same `wl_surface`, layer surface and swapchain. No show
+  waits for the compositor's `configure` on the event thread: the first frame draws when it
+  arrives, and an overlay whose surface is never configured (2 s) reports `Unavailable`.
 - X11: an override-redirect notification window, empty input shape unless interactive.
 - macOS: winit's view (and the Metal layer wgpu draws into) moves into a non-activating
   `NSPanel` (`NonactivatingPanel`, `becomesKeyOnlyIfNeeded`) at status level (25) on every

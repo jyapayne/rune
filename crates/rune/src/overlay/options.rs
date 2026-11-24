@@ -170,7 +170,11 @@ pub struct OverlayOptions {
     pub input: OverlayInput,
     /// Create and warm a hidden native host on the event thread at startup. Desktop hosts
     /// retain their window and GPU surface across hide/show (unless
-    /// `ConfiguredOverlay::release_gpu_when_hidden`); Wayland must recreate on hide.
+    /// `ConfiguredOverlay::release_gpu_when_hidden`). A Wayland layer surface is retained too:
+    /// a hide unmaps it with a null buffer instead of destroying it, and the next show commits
+    /// its role state again and draws when the compositor's `configure` arrives, on the same
+    /// `wl_surface`, layer surface and swapchain, without waiting on the event thread. A
+    /// Wayland overlay that isn't prewarmed, or that gives its GPU back, is made for each show.
     /// macOS orders the panel in at alpha zero only for a scoped prewarm, then orders it out.
     /// Initial preparation settles the view. Later reveals refresh content, geometry and
     /// live values while preserving motion elapsed since each hidden commit. Hidden motion

@@ -43,9 +43,15 @@ impl OverlayCore {
             }
         }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if let Some(Live { backing: Backing::Xwayland(surface), .. }) = self.surface.live_mut() {
-            if was_live && size == self.at.size { surface.place(self.at, &self.options); }
-            surface.show();
+        match self.surface.live_mut().map(|l| &mut l.backing) {
+            Some(Backing::Xwayland(surface)) => {
+                if was_live && size == self.at.size { surface.place(self.at, &self.options); }
+                surface.show();
+            }
+            // One the last hide unmapped asks the compositor to configure it again; the frame
+            // waits for that (`awaiting_layer_frame`), not this call.
+            Some(Backing::Layer(layer)) => layer.show(self.at),
+            _ => {}
         }
         let effects = self.presence.step(presence::Event::Show, self.release);
         self.carry_out(app, effects);
@@ -238,10 +244,7 @@ impl OverlayCore {
                 window.set_visible(false);
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-            Backing::Layer(_) | Backing::Xwayland(_) => {
-                self.surface.take_live();
-                self.drop_hidden_images(app);
-            }
+            Backing::Layer(_) | Backing::Xwayland(_) => self.hide_surface(app),
         }
     }
 
@@ -274,10 +277,6 @@ impl OverlayCore {
         };
         let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, output)?;
         layer.set_buffer_scale(scale);
-        if let Some((w, h)) = layer.configured_size() {
-            if w > 0 { self.at.size.0 = w as f32; }
-            if h > 0 { self.at.size.1 = h as f32; }
-        }
         self.shared.native.lock().unwrap().1 = crate::OverlayCapabilities {
             capture_exclusion: OverlaySupport::Unsupported, global_pointer: OverlaySupport::Unsupported,
             nonactivating_keys: if layer.supports_keys() { OverlaySupport::Supported } else { OverlaySupport::Unsupported },

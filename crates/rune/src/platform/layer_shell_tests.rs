@@ -109,35 +109,6 @@ fn read_keymap_fd_ignores_and_preserves_shared_file_offset() -> std::io::Result<
 }
 
 #[test]
-fn wait_for_configure_times_out_on_silent_socket_and_errors_on_hangup() -> std::io::Result<()> {
-    use std::os::unix::net::UnixStream;
-    use std::time::{Duration, Instant};
-    use wayland_client::Connection;
-    use crate::platform::layer_shell_machine::configure_wait::Outcome;
-
-    let (client, _server) = UnixStream::pair()?;
-    let Ok(conn) = Connection::from_socket(client) else { return Ok(()); };
-    let mut queue = conn.new_event_queue::<super::State>();
-    let mut state = super::State::default();
-    let started = Instant::now();
-    let outcome = super::wait_for_configure(&conn, &mut queue, &mut state, Duration::from_millis(40));
-    assert_eq!(outcome, Outcome::TimedOut);
-    assert!(started.elapsed() >= Duration::from_millis(30));
-    assert!(started.elapsed() < Duration::from_secs(2));
-
-    let (client, server) = UnixStream::pair()?;
-    drop(server);
-    let Ok(conn) = Connection::from_socket(client) else { return Ok(()); };
-    let mut queue = conn.new_event_queue::<super::State>();
-    let mut state = super::State::default();
-    let started = Instant::now();
-    let outcome = super::wait_for_configure(&conn, &mut queue, &mut state, Duration::from_secs(2));
-    assert_eq!(outcome, Outcome::Error);
-    assert!(started.elapsed() < Duration::from_secs(1));
-    Ok(())
-}
-
-#[test]
 fn xkb_compose_feeds_dead_keys_and_resets_after_composed_or_cancelled() {
     use xkbcommon::xkb;
     use crate::platform::layer_shell_machine::keyboard::ComposeOutcome;
@@ -406,7 +377,7 @@ fn has_pending_events_tracks_foreign_queue_until_dispatched_and_false_when_close
         host_read_once(&host);
         assert!(layer.has_pending_events());
         let changes = layer.dispatch();
-        assert!(changes.closed);
+        assert_eq!(changes.gone, Some(super::Gone::Closed));
         assert!(!layer.is_live());
         assert!(!layer.has_pending_events(), "closed surface must never report pending events");
 
@@ -458,9 +429,8 @@ fn display_error_reports_dead_connection_and_none_when_live() -> std::io::Result
     let (client, server) = UnixStream::pair()?;
     drop(server);
     let Ok(dead) = Connection::from_socket(client) else { return Ok(()); };
-    let mut queue = dead.new_event_queue::<super::State>();
-    let mut state = super::State::default();
-    let _ = super::wait_for_configure(&dead, &mut queue, &mut state, std::time::Duration::from_secs(1));
+    // A read finds the hangup, as winit's would.
+    if let Some(guard) = dead.prepare_read() { let _ = guard.read(); }
     let dead_ptr = NonNull::new(dead.display().id().as_ptr().cast()).expect("wl_display");
     let err = super::display_error(RawDisplayHandle::Wayland(WaylandDisplayHandle::new(dead_ptr)));
     assert!(err.is_some(), "expected socket error from dead display");
@@ -556,6 +526,21 @@ fn drop_destroys_all_proxies_and_drains_queued_events_so_event_queue_does_not_le
         (shell_destroyed, handle)
     }
 
+    /// Turns the loop until the mock's configure is acked, as the app's turns would: the
+    /// surface is made without waiting for it.
+    fn configured(host: &Connection, layer: &mut super::LayerSurface) {
+        for _ in 0..400 {
+            match host.prepare_read() {
+                Some(guard) => { let _ = guard.read(); }
+                None => { host.backend().dispatch_inner_queue().ok(); }
+            }
+            layer.dispatch();
+            if layer.frame_ready() { return; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the mock compositor never configured the surface");
+    }
+
     let placement = Placement { size: (200.0, 100.0), edge: ScreenEdge::Top, margin: 0.0, align: Align::Start, inset: 0.0 };
     let options = OverlayOptions::default();
 
@@ -570,7 +555,8 @@ fn drop_destroys_all_proxies_and_drains_queued_events_so_event_queue_does_not_le
             NonNull::new(host.display().id().as_ptr().cast()).unwrap(),
         ));
         let mut layer = super::LayerSurface::new(display, "test-queued", placement, false, &options, None)
-            .expect("configured layer surface");
+            .expect("layer surface");
+        configured(&host, &mut layer);
         let conn_probe = layer.conn.clone();
 
         // Requesting a second frame callback destroys the previous pending one immediately.
@@ -644,7 +630,8 @@ fn drop_destroys_all_proxies_and_drains_queued_events_so_event_queue_does_not_le
             NonNull::new(host.display().id().as_ptr().cast()).unwrap(),
         ));
         let mut layer = super::LayerSurface::new(display, "test-pending-cb", placement, false, &options, None)
-            .expect("configured layer surface");
+            .expect("layer surface");
+        configured(&host, &mut layer);
         let conn_probe = layer.conn.clone();
         layer.request_frame();
         let cb = layer.state.frame_callback.as_ref().unwrap().1.clone();

@@ -3,12 +3,10 @@
 //! input regions and the rendered buffer share a commit. Global pointer observation and
 //! capture exclusion are unavailable. wgpu draws through the raw `wl_surface`.
 
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
-use std::time::Duration;
 
 use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
-use wayland_backend::client::{Backend, ReadEventsGuard, WaylandError};
+use wayland_backend::client::Backend;
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -22,22 +20,24 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1:
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1};
-use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{KeyboardInteractivity, ZwlrLayerSurfaceV1};
 
-use super::layer_shell_machine::{configure_wait, connection, exclusive_zone, frame_callback, keyboard, pointer, readiness, repeat, text_input as text_input_machine, touch};
-use crate::el::Align;
-use crate::overlay::{Placement, ScreenEdge};
+use super::layer_shell_machine::{connection, frame_callback, keyboard, mapping, pointer, repeat, text_input as text_input_machine, touch};
+use crate::machine::Seq;
+use crate::overlay::Placement;
 use crate::{OverlayInput, OverlayOptions, OverlayPlacement};
 
 mod compose;
 mod dead;
 mod keys;
+mod map;
 mod pointing;
 mod text_input;
 mod watch;
 pub(crate) use dead::display_error;
 use dead::{classify_turn_error, format_wayland_error};
 use pointing::{Over, shape};
+pub(crate) use super::layer_shell_machine::mapping::Gone;
 pub(crate) use watch::Watch;
 
 pub(crate) enum Input {
@@ -50,9 +50,16 @@ pub(crate) enum Input {
 
 #[derive(Default)]
 struct State {
-    /// How far the compositor has got with the surface: its first configure is what makes it
-    /// drawable, and closing it is final.
-    readiness: readiness::State,
+    /// The surface's life with the compositor: asked to configure, configured, mapped by a
+    /// buffer, unmapped for the next show, or gone.
+    mapping: mapping::State,
+    mapping_seq: Seq,
+    /// What `mapping` asked of the surface's proxies, until `LayerSurface::carry_out`.
+    asked: Vec<mapping::Effect>,
+    /// The `wl_display.sync` behind an unmap, kept so a drop can destroy it unanswered.
+    fence: Option<WlCallback>,
+    /// The buffer scale the compositor prefers, until `dispatch` reads it.
+    scale: Option<i32>,
     /// Tracks whether the compositor has answered the last presented frame's `wl_surface.frame`
     /// callback so the overlay never blocks in Mesa's FIFO wait when the surface isn't painted.
     frame: frame_callback::State,
@@ -169,25 +176,7 @@ impl Dispatch<WlCallback, u64> for State {
 impl Dispatch<WlSurface, ()> for State {
     fn event(state: &mut Self, _: &WlSurface, event: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let wl_surface::Event::PreferredBufferScale { factor } = event {
-            readiness::step(&mut state.readiness, readiness::Event::Scale(factor.max(1)));
-        }
-    }
-}
-impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
-    fn event(state: &mut Self, layer: &ZwlrLayerSurfaceV1, event: zwlr_layer_surface_v1::Event, _: &(), conn: &Connection, _: &QueueHandle<Self>) {
-        match event {
-            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
-                layer.ack_configure(serial);
-                readiness::step(&mut state.readiness, readiness::Event::Configure { width, height });
-            }
-            zwlr_layer_surface_v1::Event::Closed => {
-                readiness::step(&mut state.readiness, readiness::Event::Closed);
-                frame_callback::step(&mut state.frame, frame_callback::Event::Reset);
-                if let Some((_, cb)) = state.frame_callback.take() {
-                    conn.backend().destroy_object(&cb.id()).ok();
-                }
-            }
-            _ => {}
+            state.scale = Some(factor.max(1));
         }
     }
 }
@@ -197,7 +186,8 @@ pub(crate) struct Changes {
     pub size: Option<(u32, u32)>,
     pub input: Vec<Input>,
     pub scale: Option<i32>,
-    pub closed: bool,
+    /// Why the surface can't show again, once it can't.
+    pub gone: Option<Gone>,
 }
 
 pub(crate) struct LayerSurface {
@@ -215,68 +205,12 @@ pub(crate) struct LayerSurface {
     state: State,
     layer: ZwlrLayerSurfaceV1,
     surface: WlSurface,
+    /// Where the role state last put the surface, for the commit that maps it again.
+    at: Placement,
+    /// The keyboard interactivity the role state asks for: none until the overlay asks for keys.
+    interactivity: KeyboardInteractivity,
+    buffer_scale: i32,
     display: NonNull<std::ffi::c_void>,
-}
-
-struct ConfigureDriver<'a> {
-    conn: &'a Connection,
-    queue: &'a mut EventQueue<State>,
-    state: &'a mut State,
-}
-
-impl configure_wait::Driver for ConfigureDriver<'_> {
-    type Guard = ReadEventsGuard;
-
-    fn done(&self) -> bool { self.state.readiness.configured() }
-
-    fn now(&mut self) -> crate::time::Instant { crate::time::now() }
-
-    fn dispatch_pending(&mut self) -> bool {
-        self.queue.dispatch_pending(self.state).is_ok()
-            && self.conn.backend().last_error().is_none()
-    }
-
-    fn flush(&mut self) -> configure_wait::Flush {
-        match self.queue.flush() {
-            Ok(()) => configure_wait::Flush::Ok,
-            Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => configure_wait::Flush::WouldBlock,
-            Err(_) => configure_wait::Flush::Error,
-        }
-    }
-
-    fn prepare_read(&mut self) -> Option<ReadEventsGuard> { self.queue.prepare_read() }
-
-    #[allow(unsafe_code)]
-    fn poll(&mut self, guard: &ReadEventsGuard, timeout_ms: i32, want_write: bool) -> configure_wait::Poll {
-        let events = if want_write { libc::POLLIN | libc::POLLOUT } else { libc::POLLIN };
-        let mut pfd = libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events, revents: 0 };
-        // SAFETY: one pollfd for the live Wayland display socket borrowed by `guard`.
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                configure_wait::Poll::Interrupted
-            } else {
-                configure_wait::Poll::Error
-            };
-        }
-        if ret == 0 { return configure_wait::Poll::TimedOut; }
-        if pfd.revents & libc::POLLNVAL != 0 { return configure_wait::Poll::Error; }
-        if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 { return configure_wait::Poll::Readable; }
-        if want_write && pfd.revents & libc::POLLOUT != 0 { return configure_wait::Poll::WritableOnly; }
-        configure_wait::Poll::Error
-    }
-
-    fn read(&mut self, guard: ReadEventsGuard) -> configure_wait::Read {
-        match guard.read() {
-            Ok(_) => configure_wait::Read::Ok,
-            Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => configure_wait::Read::WouldBlock,
-            Err(_) => configure_wait::Read::Error,
-        }
-    }
-}
-
-fn wait_for_configure(conn: &Connection, queue: &mut EventQueue<State>, state: &mut State, timeout: Duration) -> configure_wait::Outcome {
-    configure_wait::wait(&mut ConfigureDriver { conn, queue, state }, timeout)
 }
 
 fn wire_layer(layer: crate::WaylandLayer) -> Layer {
@@ -311,8 +245,9 @@ fn drain_event_queue(queue: &mut EventQueue<State>, state: &mut State) {
 }
 
 impl LayerSurface {
-    /// None when the display isn't Wayland, the compositor lacks layer-shell, or it never
-    /// configures the surface within `configure_wait::TIMEOUT`.
+    /// None when the display isn't Wayland or the compositor lacks layer-shell. The role state
+    /// is committed and the compositor's first `configure` asked for, not waited for: a later
+    /// `dispatch` acks it, and `frame_ready` says when a frame may draw.
     #[allow(unsafe_code)]
     pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
@@ -354,13 +289,9 @@ impl LayerSurface {
         let seat_global = globals.contents().with_list(|list| list.iter().find(|g| g.interface == "wl_seat").map(|g| (g.name, g.version.min(8))));
         let seat = if want_pointer || want_keys { seat_global.map(|(name, version)| globals.registry().bind::<WlSeat, _, _>(name, version, &qh, ())) } else { None };
         let surface = compositor.create_surface(&qh, ());
-        let region = compositor.create_region(&qh, ());
-        surface.set_input_region(Some(&region));
-        region.destroy();
         // There is no layer above Overlay; relative ordering of peers on one layer is
         // compositor policy, unlike AppKit's numeric levels.
         let layer = shell.get_layer_surface(&surface, output.as_ref(), wire_layer(options.wayland_layer), namespace.to_owned(), &qh, ());
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
         let text_input_manager = want_keys
             .then(|| globals.bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ()).ok())
@@ -378,82 +309,23 @@ impl LayerSurface {
             text_input,
             ..State::default()
         };
-        let mut this = LayerSurface { namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, shell, output, seat, options: options.clone(), queue, state, layer, surface, display: display.display };
-        this.place(at);
-        this.surface.commit();
-        match wait_for_configure(&this.conn, &mut this.queue, &mut this.state, configure_wait::TIMEOUT) {
-            configure_wait::Outcome::Done => {}
-            configure_wait::Outcome::TimedOut => {
-                eprintln!("rune: Wayland layer surface '{namespace}' timed out waiting for initial configure");
-                return None;
-            }
-            configure_wait::Outcome::Error => {
-                if let Some(reason) = this.conn.backend().last_error().and_then(|e| format_wayland_error(&e)) {
-                    eprintln!("rune: Wayland layer surface '{namespace}' failed: the display connection failed: {reason}");
-                }
-                return None;
-            }
-        }
-        if this.state.readiness.closed() { return None; }
+        let mut this = LayerSurface {
+            namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global,
+            // Takes no input until the first frame publishes its hit regions.
+            regions: std::cell::RefCell::new(Some(Vec::new())),
+            compositor, shell, output, seat, options: options.clone(), queue, state, layer, surface,
+            at, interactivity: KeyboardInteractivity::None, buffer_scale: 1, display: display.display,
+        };
+        this.state.step_mapping(mapping::Event::Map { now: crate::time::now() });
+        this.carry_out();
+        this.flush_checked();
+        if !this.is_live() { return None; }
         Some(this)
     }
 
     pub fn set_placement(&mut self, placement: Option<OverlayPlacement>) {
         self.options.placement = placement;
     }
-
-    pub fn place(&mut self, at: Placement) {
-        self.layer.set_exclusive_zone(exclusive_zone(self.options.placement, self.options.exclusive_zone));
-        match self.options.placement {
-            Some(OverlayPlacement::FullScreen) => {
-                self.layer.set_size(0, 0);
-                self.layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-                self.layer.set_margin(0, 0, 0, 0);
-                return;
-            }
-            Some(OverlayPlacement::Rect { x, y, width, height }) => {
-                self.layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
-                self.layer.set_anchor(Anchor::Top | Anchor::Left);
-                self.layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
-                return;
-            }
-            Some(OverlayPlacement::Bar { edge, thickness, margin }) => {
-                // Zero along the edge: the compositor assigns the display's length there and
-                // reports it in `configure`.
-                let (t, m) = (thickness.ceil().max(1.0) as u32, margin.round() as i32);
-                let (anchor, size, margins) = match edge {
-                    crate::BarEdge::Top => (Anchor::Top | Anchor::Left | Anchor::Right, (0, t), (m, 0, 0, 0)),
-                    crate::BarEdge::Bottom => (Anchor::Bottom | Anchor::Left | Anchor::Right, (0, t), (0, 0, m, 0)),
-                    crate::BarEdge::Left => (Anchor::Left | Anchor::Top | Anchor::Bottom, (t, 0), (0, 0, 0, m)),
-                    crate::BarEdge::Right => (Anchor::Right | Anchor::Top | Anchor::Bottom, (t, 0), (0, m, 0, 0)),
-                };
-                self.layer.set_size(size.0, size.1);
-                self.layer.set_anchor(anchor);
-                self.layer.set_margin(margins.0, margins.1, margins.2, margins.3);
-                return;
-            }
-            _ => {}
-        }
-        let at = match self.options.placement {
-            Some(OverlayPlacement::Edge { edge, margin, align, inset }) => Placement { size: at.size, edge, margin, align, inset },
-            _ => at,
-        };
-        let (margin, inset) = (at.margin.round() as i32, at.inset.round() as i32);
-        let (vertical, top, bottom) = match at.edge {
-            ScreenEdge::Top => (Anchor::Top, margin, 0),
-            ScreenEdge::Bottom => (Anchor::Bottom, 0, margin),
-        };
-        let (horizontal, left, right) = match at.align {
-            Align::Start => (Anchor::Left, inset, 0),
-            Align::Center => (Anchor::empty(), 0, 0),
-            Align::End => (Anchor::Right, 0, inset),
-        };
-        self.layer.set_size(at.size.0.ceil() as u32, at.size.1.ceil() as u32);
-        self.layer.set_anchor(vertical | horizontal);
-        self.layer.set_margin(top, right, bottom, left);
-    }
-
-    pub fn configured_size(&self) -> Option<(u32, u32)> { self.state.readiness.size() }
 
     /// Sets the surface's pending input region; true when it changed, so it waits for a commit.
     pub fn input_regions(&self, regions: &[[f32; 4]], interactive: bool) -> bool {
@@ -467,18 +339,24 @@ impl LayerSurface {
             _ => Some(Vec::new()),
         };
         if *self.regions.borrow() == next { return false; }
-        if let Some(rects) = &next {
-            let region = self.compositor.create_region(&self.queue.handle(), ());
-            for &[x, y, w, h] in rects { region.add(x, y, w, h); }
-            self.surface.set_input_region(Some(&region));
-            region.destroy();
-        } else {
-            self.surface.set_input_region(None);
-        }
         *self.regions.borrow_mut() = next;
+        self.send_input_region();
         // No commit here: a drawn frame's presentation commits input and pixels together, and a
         // frame that draws nothing commits it alone (`Overlay::unchanged_frame`).
         true
+    }
+
+    /// Sends the input region the surface last settled on; it waits for a commit.
+    fn send_input_region(&self) {
+        match &*self.regions.borrow() {
+            Some(rects) => {
+                let region = self.compositor.create_region(&self.queue.handle(), ());
+                for &[x, y, w, h] in rects { region.add(x, y, w, h); }
+                self.surface.set_input_region(Some(&region));
+                region.destroy();
+            }
+            None => self.surface.set_input_region(None),
+        }
     }
 
     pub fn set_input(&mut self, input: OverlayInput) {
@@ -490,11 +368,13 @@ impl LayerSurface {
         if let Some(seat) = &self.seat { self.state.update_seat(seat, &self.queue.handle()); }
     }
 
-    pub fn request_keys(&self) -> bool {
+    /// Asks the compositor for the keys; false when the policy or the layer-shell version
+    /// can't. The surface keeps asking until it hides.
+    pub fn request_keys(&mut self) -> bool {
         if !keyboard::can_request_keys(self.options.keys, self.layer.version()) { return false; }
-        self.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-        self.surface.commit();
-        self.queue.flush().ok();
+        self.interactivity = KeyboardInteractivity::OnDemand;
+        self.layer.set_keyboard_interactivity(self.interactivity);
+        self.commit();
         true
     }
 
@@ -508,7 +388,7 @@ impl LayerSurface {
 
     /// Synchronizes `zwp_text_input_v3` enablement and cursor rectangle with `step`.
     pub fn sync_ime(&mut self, step: crate::input::host_events::ImeStep) -> Option<crate::Ime> {
-        if self.state.readiness.closed() { return None; }
+        if !self.is_live() { return None; }
         let (sent, ime) = self.state.sync_text_input(step);
         if sent { self.flush_checked(); }
         ime
@@ -532,7 +412,7 @@ impl LayerSurface {
     /// Requests a `wl_surface.frame` callback on this surface's private queue without committing,
     /// so it commits alongside the buffer in the immediately following `queue.present`.
     pub fn request_frame(&mut self) {
-        if self.state.readiness.closed() { return; }
+        if !self.is_live() { return; }
         for effect in frame_callback::step(&mut self.state.frame, frame_callback::Event::Request) {
             let frame_callback::Effect::Request(id) = effect;
             if let Some((_, prev)) = self.state.frame_callback.take() {
@@ -543,27 +423,17 @@ impl LayerSurface {
         }
     }
 
-    /// True when no `wl_surface.frame` callback is outstanding, so acquiring and presenting will
-    /// not block in Mesa's FIFO wait.
+    /// True when a frame may be acquired and presented: the compositor has configured the
+    /// surface, and no `wl_surface.frame` callback is outstanding, so presenting will not block
+    /// in Mesa's FIFO wait.
     pub fn frame_ready(&self) -> bool {
-        self.state.frame.ready()
+        self.state.mapping.drawable() && self.state.frame.ready()
     }
 
-    /// Commit role state (placement) without a new buffer; wgpu's present commits buffers.
-    pub fn commit(&mut self) {
-        self.surface.commit();
-        self.flush_checked();
-    }
-
-    pub fn set_buffer_scale(&mut self, scale: i32) {
-        if self.surface.version() >= 3 {
-            self.surface.set_buffer_scale(scale);
-        }
-    }
-
-    /// True while the surface has not been closed by the compositor or a fatal display error.
+    /// True until the compositor closes the surface or never configures it, or the display
+    /// connection dies.
     pub fn is_live(&self) -> bool {
-        !self.state.readiness.closed()
+        self.state.mapping.gone().is_none()
     }
 
     /// True when the surface is still live and libwayland's private event queue already holds
@@ -571,7 +441,7 @@ impl LayerSurface {
     /// present, or a roundtrip). Checks the queue in memory without syscalls by immediately
     /// dropping any prepared-read guard.
     pub fn has_pending_events(&self) -> bool {
-        !self.state.readiness.closed() && self.queue.prepare_read().is_none()
+        self.is_live() && self.queue.prepare_read().is_none()
     }
 
     /// Next held-key repeat deadline for the overlay's wake timer, or `None` when idle.
@@ -584,43 +454,49 @@ impl LayerSurface {
     pub fn dispatch(&mut self) -> Changes {
         let armed = self.state.repeat.attempt();
         self.turn();
-        if !self.state.readiness.closed() && let Some(attempt) = armed {
+        let gone = self.state.mapping.gone();
+        if gone.is_none() && let Some(attempt) = armed {
             self.state.fire_repeat(attempt, crate::time::now());
         }
         Changes {
-            size: self.state.readiness.take_size(),
+            size: self.state.mapping.take_size(),
             input: std::mem::take(&mut self.state.input),
-            scale: self.state.readiness.take_scale(),
-            closed: self.state.readiness.closed(),
+            scale: self.state.scale.take().filter(|_| gone.is_none()),
+            gone,
         }
     }
 
     /// Handles what the compositor sent to a hidden surface and drops its input, keeping size
-    /// and scale for the next `dispatch`; true once the compositor closed it. libwayland frees
+    /// and scale for the next `dispatch`; says why once the surface is gone. libwayland frees
     /// an undispatched event without closing its fd, so a queue left alone leaks every
     /// `wl_keyboard.keymap` (each virtual keyboard a paste tool makes sends a few).
-    pub fn drain(&mut self) -> bool {
+    pub fn drain(&mut self) -> Option<Gone> {
         self.turn();
         self.state.step_repeat(repeat::Event::Stop);
         self.state.reset_compose();
         self.state.step_pointer(pointer::Event::Reset);
-        if !self.state.readiness.closed() && self.state.drain_text_input() {
+        if self.is_live() && self.state.drain_text_input() {
             self.flush_checked();
         }
         self.state.input.clear();
-        self.state.readiness.closed()
+        self.state.mapping.gone()
     }
 
+    /// Dispatches what winit read for the surface, lets a configure deadline pass, and sends
+    /// what either asked for.
     fn turn(&mut self) {
-        let was_closed = self.state.readiness.closed();
-        if was_closed {
-            return;
-        }
+        if !self.is_live() { return; }
+        let waiting = self.state.mapping.attempt();
         let dispatch_err = self.queue.dispatch_pending(&mut self.state).err();
+        // After the dispatch: a configure it just read disarms the deadline.
+        if let Some(attempt) = waiting {
+            self.state.step_mapping(mapping::Event::Timeout { attempt, now: crate::time::now() });
+        }
+        self.carry_out();
         let flush_err = self.queue.flush().err();
         let last_err = self.conn.backend().last_error();
         let (kind, reason) = classify_turn_error(dispatch_err, flush_err, last_err);
-        match connection::turn_action(was_closed, kind, self.state.readiness.closed()) {
+        match connection::turn_action(false, kind, !self.is_live()) {
             connection::TurnAction::Continue
             | connection::TurnAction::StopClosed
             | connection::TurnAction::AlreadyClosed => {}
@@ -629,7 +505,7 @@ impl LayerSurface {
     }
 
     fn flush_checked(&mut self) {
-        if self.state.readiness.closed() { return; }
+        if !self.is_live() { return; }
         let flush_err = self.queue.flush().err();
         let (kind, reason) = classify_turn_error(None, flush_err, self.conn.backend().last_error());
         if kind.is_some_and(connection::is_fatal) {
@@ -638,12 +514,9 @@ impl LayerSurface {
     }
 
     fn fail_connection(&mut self, reason: Option<String>) {
-        let was_closed = self.state.readiness.closed();
-        readiness::step(&mut self.state.readiness, readiness::Event::Closed);
-        frame_callback::step(&mut self.state.frame, frame_callback::Event::Reset);
-        if let Some((_, cb)) = self.state.frame_callback.take() {
-            self.conn.backend().destroy_object(&cb.id()).ok();
-        }
+        let was_closed = !self.is_live();
+        self.state.step_mapping(mapping::Event::Closed);
+        self.state.drop_frame_callback(&self.conn);
         self.state.step_repeat(repeat::Event::Stop);
         self.state.reset_text_input_gone();
         self.state.input.clear();
@@ -675,6 +548,7 @@ impl Drop for LayerSurface {
         drain_event_queue(&mut self.queue, &mut self.state);
         let backend = self.conn.backend();
         if let Some((_, cb)) = self.state.frame_callback.take() { backend.destroy_object(&cb.id()).ok(); }
+        if let Some(fence) = self.state.fence.take() { backend.destroy_object(&fence.id()).ok(); }
         if let Some(ti) = self.state.text_input.take() { ti.destroy(); }
         if let Some(tim) = self.state.text_input_manager.take() { tim.destroy(); }
         if let Some(shape) = self.state.shape.take() { shape.destroy(); }

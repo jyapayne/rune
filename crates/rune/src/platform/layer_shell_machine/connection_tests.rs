@@ -1,4 +1,4 @@
-use super::readiness;
+use super::mapping;
 
 #[test]
 fn watch_loop_wakes_on_prequeued_and_read_events_releases_guard_before_wait_and_stops_cleanly() {
@@ -263,18 +263,19 @@ fn dead_connection_closes_layer_surface_and_reports_once() {
 
     // Fatal protocol or I/O error closes the surface and reports once.
     for kind in [ErrorKind::Protocol, ErrorKind::Io] {
-        let mut ready = readiness::State::default();
-        readiness::step(&mut ready, readiness::Event::Configure { width: 320, height: 80 });
-        assert_eq!(turn_action(ready.closed(), Some(kind), ready.closed()), TurnAction::FailAndClose);
-        readiness::step(&mut ready, readiness::Event::Closed);
-        assert!(ready.closed());
-        assert!(ready.configured());
-        assert_eq!(ready.size(), None);
-        assert_eq!(ready.take_size(), None);
-        assert_eq!(ready.take_scale(), None);
+        let mut seq = crate::machine::Seq::default();
+        let mut surface = mapping::State::default();
+        mapping::step(&mut seq, &mut surface, mapping::Event::Map { now: crate::time::Instant::now() });
+        mapping::step(&mut seq, &mut surface, mapping::Event::Configure { serial: 1, width: 320, height: 80 });
+        assert_eq!(turn_action(surface.gone().is_some(), Some(kind), surface.gone().is_some()), TurnAction::FailAndClose);
+        mapping::step(&mut seq, &mut surface, mapping::Event::Closed);
+        assert_eq!(surface.gone(), Some(mapping::Gone::Closed));
+        assert!(!surface.drawable());
+        assert_eq!(surface.take_size(), None);
+        let closed = surface.gone().is_some();
         // Any later turn on the already-closed surface is a quiet no-op (never reports twice).
-        assert_eq!(turn_action(ready.closed(), Some(kind), ready.closed()), TurnAction::AlreadyClosed);
-        assert_eq!(turn_action(ready.closed(), None, ready.closed()), TurnAction::AlreadyClosed);
+        assert_eq!(turn_action(closed, Some(kind), closed), TurnAction::AlreadyClosed);
+        assert_eq!(turn_action(closed, None, closed), TurnAction::AlreadyClosed);
     }
 
     // Even if a compositor close event arrived in the same batch as a fatal connection error,

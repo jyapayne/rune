@@ -1,6 +1,6 @@
 //! An overlay's Wayland surfaces on their own connections: what a layer or XWayland surface
-//! read since the last turn (input, a new size or scale, its close), for a shown overlay's
-//! frame and for a hidden one.
+//! read since the last turn (input, a new size or scale, its end), for a shown overlay's frame
+//! and for a hidden one, and what a hide does with the surface.
 
 use super::*;
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -9,13 +9,13 @@ use super::draw::{deliver_layer_ime, layer_resize_scale};
 impl OverlayCore {
     /// Handles what the compositor sent a shown overlay's layer or XWayland surface since the
     /// last turn, before its frame: input, and a layer's new size or scale. False when the
-    /// compositor closed the layer surface, and the overlay hid.
+    /// layer surface is gone, and the overlay hid.
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     pub(super) fn surface_turn(&mut self, app: &mut dyn OverlayApp) -> bool {
         if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
             let changes = layer.dispatch();
-            if changes.closed {
-                self.hide(app);
+            if let Some(gone) = changes.gone {
+                self.surface_gone(app, gone);
                 return false;
             }
             for input in changes.input { self.surface_input(app, input); }
@@ -45,23 +45,59 @@ impl OverlayCore {
         true
     }
 
-    /// A layer or XWayland surface kept while hidden (prewarmed, not shown yet) still drains its
-    /// connection so nothing queues for the first show.
+    /// A layer or XWayland surface kept while hidden (prewarmed and not shown yet, or unmapped
+    /// by a hide) still drains its connection so nothing queues for the next show.
     pub(super) fn drain_hidden(&mut self, app: &mut dyn OverlayApp) {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         {
-            let closed = match self.surface.live_mut().map(|l| &mut l.backing) {
+            let gone = match self.surface.live_mut().map(|l| &mut l.backing) {
                 Some(Backing::Layer(layer)) => layer.drain(),
                 Some(Backing::Xwayland(surface)) => {
                     surface.drain();
-                    false
+                    None
                 }
-                _ => false,
+                _ => None,
             };
-            if closed { self.hide(app); }
+            if let Some(gone) = gone { self.surface_gone(app, gone); }
         }
         #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
         let _ = app;
+    }
+
+    /// The layer surface can't show again: the overlay hides and the surface goes, so the next
+    /// show makes a new one. One the compositor never configured says so.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    fn surface_gone(&mut self, app: &mut dyn OverlayApp, gone: crate::platform::layer_shell::Gone) {
+        use crate::platform::layer_shell::Gone;
+        match gone {
+            Gone::Closed => self.hide(app),
+            Gone::Unanswered => self.surface_refused(app, "the compositor did not configure its surface".into()),
+        }
+    }
+
+    /// A prewarmed layer surface that keeps its GPU stays through a hide, as a prewarmed window
+    /// does elsewhere: unmapped, so the next show makes no `wl_surface`, layer surface or
+    /// swapchain, and waits for nothing on the UI thread.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    fn keeps_layer(&self) -> bool { self.options.prewarm && !self.defers_gpu() }
+
+    /// The overlay hid: a layer surface it keeps is unmapped; any other layer or XWayland
+    /// surface is destroyed.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    pub(super) fn hide_surface(&mut self, app: &mut dyn OverlayApp) {
+        if self.keeps_layer() && let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() && layer.is_live() {
+            layer.hide();
+        } else {
+            self.drop_surface(app);
+        }
+    }
+
+    /// Destroys the layer or XWayland surface with its GPU surface, and drops the images its
+    /// last frame held.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    pub(super) fn drop_surface(&mut self, app: &mut dyn OverlayApp) {
+        self.surface.take_live();
+        self.drop_hidden_images(app);
     }
 
     /// One input event a layer or XWayland surface read on its own connection.

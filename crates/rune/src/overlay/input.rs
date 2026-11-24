@@ -455,7 +455,11 @@ impl OverlayCore {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         let layer_was_visible = self.presence.shown();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if recreate_layer { self.hide(app); }
+        if recreate_layer {
+            // A new display needs a new layer surface, even where a hide keeps one.
+            self.hide(app);
+            self.drop_surface(app);
+        }
         if let Some(placement) = requests.placement {
             self.options.placement = placement;
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -530,7 +534,7 @@ impl OverlayCore {
             && let Some(panel) = &self.panel { panel.request_keys(); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
-            && let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live() { layer.request_keys(); }
+            && let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() { layer.request_keys(); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if requests.request_keys && self.presence.shown() && self.options.keys == KeyPolicy::OnDemand
             && let Some(x11) = &self.x11 { x11.request_keys(); }

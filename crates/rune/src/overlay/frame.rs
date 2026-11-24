@@ -340,6 +340,11 @@ pub(super) fn submit_and_present(live: &mut Live, renderer: &Renderer, gpu: &Gpu
             layer.request_frame();
         }
         gpu.queue.present(frame);
+        // The present committed a buffer: the compositor shows the surface from here on.
+        #[cfg(all(unix, not(target_os = "ios"), not(target_os = "android")))]
+        if !gpu.is_lost() && let Backing::Layer(layer) = &mut live.backing {
+            layer.presented();
+        }
     }
 }
 
