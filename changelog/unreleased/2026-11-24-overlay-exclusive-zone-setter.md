@@ -1,0 +1,1 @@
+- `OverlayHandle::set_exclusive_zone` changes the space a Wayland layer-shell overlay reserves while it is shown, in the commit that follows, so a panel that hides itself can give its space back to windows and take it again without being re-made. `examples/layer-bar` takes `release` and `reserve` on stdin.

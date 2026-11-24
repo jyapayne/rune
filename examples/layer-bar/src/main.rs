@@ -9,7 +9,7 @@
 //! one again.
 //!
 //! ```sh
-//! cargo run -p layer-bar                 # stdin: toggle | status | quit
+//! cargo run -p layer-bar                 # stdin: toggle | reserve | release | status | quit
 //! cargo run -p layer-bar -- --bottom     # dock along the bottom edge
 //! ```
 //!
@@ -237,6 +237,9 @@ fn main() {
             };
             match command {
                 "toggle" => bar.update(|s, _| set_open(s, !s.open)),
+                // A panel that slides away gives its space back to windows and takes it again.
+                "release" => bar.set_exclusive_zone(ExclusiveZone::Reserve(0.0)),
+                "reserve" => bar.set_exclusive_zone(ExclusiveZone::Reserve(THICKNESS)),
                 // Nothing the views read changes: neither overlay redraws for it.
                 "status" => bar.update_if(|s, _| {
                     let open = s.open;
@@ -246,7 +249,7 @@ fn main() {
                     });
                     false
                 }),
-                other => eprintln!("layer-bar: unknown command {other:?} (toggle | status | quit)"),
+                other => eprintln!("layer-bar: unknown command {other:?} (toggle | reserve | release | status | quit)"),
             }
         }
     });

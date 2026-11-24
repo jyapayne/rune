@@ -445,7 +445,7 @@ impl OverlayCore {
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             if let Some(x11) = &self.x11 { x11.set_follow_pointer(follow); }
         }
-        let options_changed = requests.placement.is_some() || requests.display.is_some();
+        let options_changed = requests.placement.is_some() || requests.display.is_some() || requests.exclusive_zone.is_some();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         let recreate_layer = should_recreate_layer(
             &self.options.display,
@@ -465,6 +465,13 @@ impl OverlayCore {
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
                 layer.set_placement(placement);
+            }
+        }
+        if let Some(zone) = requests.exclusive_zone {
+            self.options.exclusive_zone = zone;
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
+                layer.set_exclusive_zone(zone);
             }
         }
         if let Some(display) = requests.display { self.options.display = display; }

@@ -10,7 +10,7 @@ it, which a compositor with `hyprland-focus-grab-v1` (Hyprland) reports as `on_f
 It is prewarmed, so closing it unmaps its surface and opening it maps the same one again.
 
 ```sh
-cargo run -p layer-bar             # stdin: toggle | status | quit
+cargo run -p layer-bar             # stdin: toggle | reserve | release | status | quit
 cargo run -p layer-bar -- --bottom
 ```
 

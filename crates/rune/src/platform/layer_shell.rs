@@ -337,6 +337,11 @@ impl LayerSurface {
         self.options.placement = placement;
     }
 
+    /// Takes effect at the next `place`.
+    pub fn set_exclusive_zone(&mut self, zone: crate::ExclusiveZone) {
+        self.options.exclusive_zone = zone;
+    }
+
     /// Sets the surface's pending input region; true when it changed, so it waits for a commit.
     pub fn input_regions(&self, regions: &[[f32; 4]], interactive: bool) -> bool {
         let next = match self.options.input.resolved(interactive) {

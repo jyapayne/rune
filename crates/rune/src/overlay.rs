@@ -169,6 +169,7 @@ impl SharedCore {
     fn set_follow_pointer(&self, follow: bool) { self.request(|q| q.follow_pointer = Some(follow)); }
     fn refollow_pointer(&self) { self.request(|q| q.refollow = true); }
     fn set_placement(&self, placement: Option<OverlayPlacement>) { self.request(|q| q.placement = Some(placement)); }
+    fn set_exclusive_zone(&self, zone: crate::ExclusiveZone) { self.request(|q| q.exclusive_zone = Some(zone)); }
     fn set_display(&self, display: DisplayTarget) { self.request(|q| q.display = Some(display)); }
     fn request_keys(&self) { self.request(|q| q.request_keys = true); }
     fn window_number(&self) -> Option<u32> { self.native.lock().unwrap().0 }
@@ -240,6 +241,10 @@ impl<T: 'static> OverlayHandle<T> {
     /// None restores the spec's legacy edge placement.
     #[inline(always)]
     pub fn set_placement(&self, placement: Option<OverlayPlacement>) { self.shared.core.set_placement(placement); }
+    /// Wayland: changes the space the overlay reserves while it is shown, so a panel that
+    /// slides away can give its space back to windows and take it again. Other backends ignore it.
+    #[inline(always)]
+    pub fn set_exclusive_zone(&self, zone: crate::ExclusiveZone) { self.shared.core.set_exclusive_zone(zone); }
     #[inline(always)]
     pub fn set_display(&self, display: DisplayTarget) { self.shared.core.set_display(display); }
 

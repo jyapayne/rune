@@ -22,6 +22,7 @@ pub(super) struct Requests {
     pub input: Option<crate::OverlayInput>,
     pub follow_pointer: Option<bool>,
     pub placement: Option<Option<crate::OverlayPlacement>>,
+    pub exclusive_zone: Option<crate::ExclusiveZone>,
     pub display: Option<crate::DisplayTarget>,
     pub request_keys: bool,
     /// Move to the display under the pointer now (`OverlayHandle::refollow_pointer`).
