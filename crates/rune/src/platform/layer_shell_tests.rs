@@ -1,4 +1,4 @@
-use super::{feed_compose, named_keysym, read_keymap_fd};
+use super::keys::{feed_compose, named_keysym, read_keymap_fd};
 use crate::platform::layer_shell_machine::keyboard::MAX_KEYMAP_BYTES;
 use crate::Key;
 

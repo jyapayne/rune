@@ -53,6 +53,7 @@ use frame::{OverlayRenderArgs, idle_after, render_frame, step};
 #[path = "overlay/input.rs"]
 mod input;
 pub(crate) mod keys;
+mod layer;
 #[path = "overlay/lifetime.rs"]
 mod lifetime;
 pub(crate) mod options;

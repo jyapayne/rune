@@ -3,10 +3,8 @@
 //! input regions and the rendered buffer share a commit. Global pointer observation and
 //! capture exclusion are unavailable. wgpu draws through the raw `wl_surface`.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
@@ -17,9 +15,9 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_client::protocol::{wl_output::{self, WlOutput}, wl_seat::{self, WlSeat}, wl_pointer::{self, WlPointer}, wl_keyboard::{self, WlKeyboard}, wl_touch::{self, WlTouch}};
+use wayland_client::protocol::{wl_keyboard::WlKeyboard, wl_output::{self, WlOutput}, wl_pointer::WlPointer, wl_seat::{self, WlSeat}, wl_touch::WlTouch};
 use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle};
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
@@ -29,14 +27,18 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self
 use super::layer_shell_machine::{configure_wait, connection, exclusive_zone, frame_callback, keyboard, pointer, readiness, repeat, text_input as text_input_machine, touch};
 use crate::el::Align;
 use crate::overlay::{Placement, ScreenEdge};
-use crate::runtime::Waker;
 use crate::{OverlayInput, OverlayOptions, OverlayPlacement};
 
 mod compose;
 mod dead;
+mod keys;
+mod pointing;
 mod text_input;
+mod watch;
 pub(crate) use dead::display_error;
 use dead::{classify_turn_error, format_wayland_error};
+use pointing::{Over, shape};
+pub(crate) use watch::Watch;
 
 pub(crate) enum Input {
     Move(f32, f32), Leave, Button(bool), Secondary(bool), ExtraButton(crate::PointerButton, bool),
@@ -44,19 +46,6 @@ pub(crate) enum Input {
     Focus(bool), Key(crate::KeyEvent), KeyRepeat(crate::KeyEvent), KeyUp(crate::KeyEvent),
     Physical(crate::PhysicalInput, Option<crate::KeyEvent>),
     Ime(crate::Ime),
-}
-
-/// Whether the pointer is over the surface: the serial of its enter, which setting a cursor
-/// needs, and the cursor the surface set since (none: the one it arrived with).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum Over {
-    #[default]
-    Outside,
-    Inside { serial: u32, cursor: Option<crate::el::Cursor> },
-}
-
-impl Over {
-    fn inside(self) -> bool { matches!(self, Over::Inside { .. }) }
 }
 
 #[derive(Default)]
@@ -123,54 +112,6 @@ impl State {
         self.compose.reset();
     }
 
-    fn step_pointer(&mut self, event: pointer::Event) {
-        for effect in pointer::step(&mut self.pointer_axis, event) {
-            let pointer::Effect::Wheel(wheel) = effect;
-            self.input.push(Input::Wheel(wheel));
-        }
-    }
-
-    fn flush_pointer_frame(&mut self, framed: bool) {
-        let mods = self.xkb.as_ref().map_or_else(crate::Mods::default, key_mods);
-        self.step_pointer(pointer::Event::Frame { mods, framed });
-    }
-    fn emit_key(&mut self, key: u32, pressed: bool, repeat: bool) {
-        use winit::platform::scancode::PhysicalKeyExtScancode;
-        let Some(xkb) = &self.xkb else { return };
-        let physical = match crate::PhysicalKeyCode::from_scancode(key) {
-            winit::keyboard::PhysicalKey::Code(code) => Some(code),
-            _ => None,
-        };
-        let mods = key_mods(xkb);
-        let compose_action = keyboard::compose_action(pressed, repeat, mods);
-        let fallback = key_event(xkb, self.compose.for_key(compose_action), key, physical, pressed, repeat);
-        if let Some(code) = physical {
-            self.input.push(Input::Physical(
-                crate::PhysicalInput::Key { key: code, mods, pressed, repeat },
-                fallback,
-            ));
-        } else if let Some(key) = fallback {
-            self.input.push(match (pressed, repeat) {
-                (true, true) => Input::KeyRepeat(key),
-                (true, false) => Input::Key(key),
-                (false, _) => Input::KeyUp(key),
-            });
-        }
-    }
-
-    fn fire_repeat(&mut self, attempt: crate::machine::Attempt, now: crate::time::Instant) {
-        for effect in repeat::step(&mut self.repeat_seq, &mut self.repeat, repeat::Event::Due { attempt, now }) {
-            match effect {
-                repeat::Effect::Repeat { key } => {
-                    if self.keyboard_focus.focused() {
-                        self.emit_key(key, true, true);
-                    }
-                }
-                repeat::Effect::WakeAt(_) => {}
-            }
-        }
-    }
-
     fn update_seat(&mut self, seat: &WlSeat, qh: &QueueHandle<Self>) {
         let caps = self.capabilities.unwrap_or_else(wl_seat::Capability::empty);
         let pointer = self.want_pointer && caps.contains(wl_seat::Capability::Pointer);
@@ -203,243 +144,6 @@ impl State {
         }
     }
 }
-fn pointer_axis(axis: wl_pointer::Axis) -> Option<pointer::Axis> {
-    match axis {
-        wl_pointer::Axis::VerticalScroll => Some(pointer::Axis::Vertical),
-        wl_pointer::Axis::HorizontalScroll => Some(pointer::Axis::Horizontal),
-        _ => None,
-    }
-}
-
-fn pointer_axis_source(source: wl_pointer::AxisSource) -> Option<pointer::AxisSource> {
-    match source {
-        wl_pointer::AxisSource::Wheel => Some(pointer::AxisSource::Wheel),
-        wl_pointer::AxisSource::Finger => Some(pointer::AxisSource::Finger),
-        wl_pointer::AxisSource::Continuous => Some(pointer::AxisSource::Continuous),
-        wl_pointer::AxisSource::WheelTilt => Some(pointer::AxisSource::WheelTilt),
-        _ => None,
-    }
-}
-
-impl Dispatch<WlPointer, ()> for State {
-    fn event(state: &mut Self, wl_pointer: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        match event {
-            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
-                // Until the surface sets a cursor, the pointer keeps the one it arrived with.
-                let inside = state.surface.as_ref() == Some(&surface);
-                state.step_pointer(pointer::Event::Reset);
-                state.over = if inside { Over::Inside { serial, cursor: None } } else { Over::Outside };
-                if inside { state.input.push(Input::Move(surface_x as f32, surface_y as f32)); }
-            }
-            wl_pointer::Event::Motion { surface_x, surface_y, .. } if state.over.inside() => state.input.push(Input::Move(surface_x as f32, surface_y as f32)),
-            wl_pointer::Event::Leave { surface, .. } if state.surface.as_ref() == Some(&surface) => {
-                state.over = Over::Outside;
-                state.step_pointer(pointer::Event::Reset);
-                state.input.push(Input::Leave);
-            }
-            wl_pointer::Event::Button { button, state: wayland_client::WEnum::Value(button_state), .. } if state.over.inside() => {
-                let pressed = button_state == wl_pointer::ButtonState::Pressed;
-                match pointer::button_from_linux(button) {
-                    crate::PointerButton::Primary => {
-                        state.input.push(Input::Button(pressed));
-                        if pressed && let Some(xkb) = &state.xkb {
-                            state.input.push(Input::Physical(crate::PhysicalInput::Modifiers(key_mods(xkb)), None));
-                        }
-                    }
-                    crate::PointerButton::Secondary => state.input.push(Input::Secondary(pressed)),
-                    other => state.input.push(Input::ExtraButton(other, pressed)),
-                }
-            }
-            wl_pointer::Event::Axis { axis: wayland_client::WEnum::Value(axis), value, .. } if state.over.inside() => {
-                if let Some(axis) = pointer_axis(axis) {
-                    state.step_pointer(pointer::Event::Axis { axis, value });
-                    if wl_pointer.version() < 5 { state.flush_pointer_frame(false); }
-                }
-            }
-            wl_pointer::Event::AxisSource { axis_source: wayland_client::WEnum::Value(source) } if state.over.inside() => {
-                if let Some(source) = pointer_axis_source(source) { state.step_pointer(pointer::Event::AxisSource(source)); }
-            }
-            wl_pointer::Event::AxisDiscrete { axis: wayland_client::WEnum::Value(axis), discrete } if state.over.inside() => {
-                if let Some(axis) = pointer_axis(axis) { state.step_pointer(pointer::Event::AxisDiscrete { axis, discrete }); }
-            }
-            wl_pointer::Event::AxisValue120 { axis: wayland_client::WEnum::Value(axis), value120 } if state.over.inside() => {
-                if let Some(axis) = pointer_axis(axis) { state.step_pointer(pointer::Event::AxisValue120 { axis, value120 }); }
-            }
-            wl_pointer::Event::AxisStop { axis: wayland_client::WEnum::Value(axis), .. } if state.over.inside() => {
-                if let Some(axis) = pointer_axis(axis) { state.step_pointer(pointer::Event::AxisStop { axis }); }
-            }
-            wl_pointer::Event::Frame if state.over.inside() => state.flush_pointer_frame(true),
-            _ => {}
-        }
-    }
-}
-impl Dispatch<WlTouch, ()> for State {
-    fn event(state: &mut Self, _: &WlTouch, event: wl_touch::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        use touch::Event as Touch;
-        let event = match event {
-            wl_touch::Event::Down { surface, id, x, y, .. } if state.surface.as_ref() == Some(&surface) => Touch::Down { id, x: x as f32, y: y as f32 },
-            wl_touch::Event::Motion { id, x, y, .. } => Touch::Motion { id, x: x as f32, y: y as f32 },
-            wl_touch::Event::Up { id, .. } => Touch::Up { id },
-            wl_touch::Event::Cancel => Touch::Cancel,
-            _ => return,
-        };
-        for effect in touch::step(&mut state.finger, event) {
-            state.input.push(match effect {
-                touch::Effect::Move(x, y) => Input::Move(x, y),
-                touch::Effect::Press => Input::Button(true),
-                touch::Effect::Release => Input::Button(false),
-                touch::Effect::Leave => Input::Leave,
-            });
-        }
-    }
-}
-impl Dispatch<WlKeyboard, ()> for State {
-    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        use xkbcommon::xkb;
-        match event {
-            wl_keyboard::Event::Enter { surface, .. } => {
-                state.step_repeat(repeat::Event::Stop);
-                state.reset_compose();
-                let focus_event = if state.surface.as_ref() == Some(&surface) {
-                    keyboard::FocusEvent::EnterOurs
-                } else {
-                    keyboard::FocusEvent::EnterOther
-                };
-                state.step_keyboard_focus(focus_event);
-            }
-            wl_keyboard::Event::Leave { surface, .. } if state.surface.as_ref() == Some(&surface) => {
-                state.step_repeat(repeat::Event::Stop);
-                state.reset_compose();
-                state.step_keyboard_focus(keyboard::FocusEvent::LeaveOurs);
-            }
-            wl_keyboard::Event::Keymap { format: wayland_client::WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
-                if let Some(map) = read_keymap_fd(fd, size) {
-                    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-                    state.xkb = xkb::Keymap::new_from_string(&context, map, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::COMPILE_NO_FLAGS).map(|map| {
-                        let mut xkb_state = xkb::State::new(&map);
-                        if let Some(m) = state.mod_state {
-                            xkb_state.update_mask(m.depressed, m.latched, m.locked, 0, 0, m.group);
-                        }
-                        xkb_state
-                    });
-                    state.compose.on_keymap(state.xkb.is_some());
-                    if let Some(held) = state.repeat.key()
-                        && !state.xkb.as_ref().is_some_and(|xkb| xkb.get_keymap().key_repeats(xkb::Keycode::new(held + 8)))
-                    {
-                        state.step_repeat(repeat::Event::Stop);
-                    }
-                }
-            }
-            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
-                state.mod_state = Some(keyboard::ModState { depressed: mods_depressed, latched: mods_latched, locked: mods_locked, group });
-                if let Some(xkb) = &mut state.xkb {
-                    xkb.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                    state.input.push(Input::Physical(crate::PhysicalInput::Modifiers(key_mods(xkb)), None));
-                }
-            }
-            wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                state.step_repeat(repeat::Event::RepeatInfo { rate, delay_ms: delay });
-            }
-            wl_keyboard::Event::Key { key, state: wayland_client::WEnum::Value(key_state), .. } if state.keyboard_focus.focused() => {
-                match key_state {
-                    wl_keyboard::KeyState::Pressed => {
-                        state.emit_key(key, true, false);
-                        let repeats = state.xkb.as_ref().is_some_and(|xkb| xkb.get_keymap().key_repeats(xkb::Keycode::new(key + 8)));
-                        state.step_repeat(repeat::Event::Press { key, repeats, now: crate::time::now() });
-                    }
-                    wl_keyboard::KeyState::Released => {
-                        state.emit_key(key, false, false);
-                        state.step_repeat(repeat::Event::Release { key });
-                    }
-                    wl_keyboard::KeyState::Repeated => {
-                        state.emit_key(key, true, true);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Reads a Wayland `wl_keyboard.keymap` fd from offset `0` without touching the open file
-/// description's file offset. Compositors such as Hyprland and niri share one open file
-/// description across clients and binds, so sequential `read()` advances the shared offset and
-/// leaves later readers at EOF.
-fn read_keymap_fd(fd: OwnedFd, size: u32) -> Option<String> {
-    use std::os::unix::fs::FileExt;
-    let file = std::fs::File::from(fd);
-    keyboard::decode_keymap(size, |buf, offset| file.read_exact_at(buf, offset))
-}
-
-fn key_mods(state: &xkbcommon::xkb::State) -> crate::Mods {
-    use xkbcommon::xkb;
-    let active = |name: &str| state.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE);
-    crate::input::key_table::mods_from_keys(active(xkb::MOD_NAME_SHIFT), active(xkb::MOD_NAME_CTRL), active(xkb::MOD_NAME_ALT), active(xkb::MOD_NAME_LOGO))
-}
-
-fn feed_compose(compose: &mut xkbcommon::xkb::compose::State, sym: xkbcommon::xkb::Keysym) -> keyboard::ComposeOutcome {
-    use xkbcommon::xkb::compose::{FeedResult, Status};
-    match compose.feed(sym) {
-        FeedResult::Ignored => keyboard::ComposeOutcome::Nothing,
-        FeedResult::Accepted => match compose.status() {
-            Status::Nothing => keyboard::ComposeOutcome::Nothing,
-            Status::Composing => keyboard::ComposeOutcome::Composing,
-            Status::Composed => {
-                let text = compose.utf8();
-                compose.reset();
-                keyboard::ComposeOutcome::Composed(text)
-            }
-            Status::Cancelled => {
-                compose.reset();
-                keyboard::ComposeOutcome::Cancelled
-            }
-        },
-    }
-}
-
-fn key_event(
-    state: &xkbcommon::xkb::State,
-    compose: Option<&mut xkbcommon::xkb::compose::State>,
-    key: u32,
-    physical: Option<crate::PhysicalKeyCode>,
-    pressed: bool,
-    repeat: bool,
-) -> Option<crate::KeyEvent> {
-    use xkbcommon::xkb;
-    let code = xkb::Keycode::new(key + 8);
-    let sym = state.key_get_one_sym(code);
-    let mods = key_mods(state);
-    let outcome = match (compose, keyboard::compose_action(pressed, repeat, mods)) {
-        (Some(compose), keyboard::ComposeAction::Feed) => feed_compose(compose, sym),
-        (Some(compose), keyboard::ComposeAction::ResetAndBypass) => {
-            compose.reset();
-            keyboard::ComposeOutcome::Nothing
-        }
-        (_, keyboard::ComposeAction::Bypass) | (None, _) => keyboard::ComposeOutcome::Nothing,
-    };
-    let text = state.key_get_utf8(code);
-    keyboard::key_event_with_compose(outcome, named_keysym(sym.raw()), xkb::keysym_to_utf32(sym), text, mods, physical)
-}
-
-/// The named key an XKB keysym is, or None for one that types (or nothing Rune names).
-fn named_keysym(symbol: u32) -> Option<crate::Key> {
-    Some(match symbol {
-        0xff1b => crate::Key::Escape, 0xff0d | 0xff8d => crate::Key::Enter, 0xff08 => crate::Key::Backspace,
-        0xffff | 0xff9f => crate::Key::Delete, 0xff09 | 0xfe20 | 0xff89 => crate::Key::Tab,
-        0xff50 | 0xff95 => crate::Key::Home, 0xff57 | 0xff9c => crate::Key::End,
-        0xff55 | 0xff9a => crate::Key::PageUp, 0xff56 | 0xff9b => crate::Key::PageDown,
-        0xff51 | 0xff96 => crate::Key::Left, 0xff52 | 0xff97 => crate::Key::Up,
-        0xff53 | 0xff98 => crate::Key::Right, 0xff54 | 0xff99 => crate::Key::Down,
-        0xffbe..=0xffd5 => crate::Key::Function((symbol - 0xffbe + 1) as u8),
-        0xff91..=0xff94 => crate::Key::Function((symbol - 0xff91 + 1) as u8),
-        0xff67 => crate::Key::ContextMenu,
-        0xff63 | 0xff9e => crate::Key::Insert, 0xff61 | 0xff15 => crate::Key::PrintScreen,
-        0xff14 => crate::Key::ScrollLock, 0xff13 | 0xff6b => crate::Key::Pause,
-        _ => return None,
-    })
-}
-
 impl Dispatch<WlRegistry, GlobalListContents> for State {
     fn event(_: &mut Self, _: &WlRegistry, _: <WlRegistry as Proxy>::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
 }
@@ -451,32 +155,6 @@ impl Dispatch<WlRegion, ()> for State {
 }
 impl Dispatch<ZwlrLayerShellV1, ()> for State {
     fn event(_: &mut Self, _: &ZwlrLayerShellV1, _: <ZwlrLayerShellV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WpCursorShapeManagerV1, ()> for State {
-    fn event(_: &mut Self, _: &WpCursorShapeManagerV1, _: <WpCursorShapeManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
-    fn event(_: &mut Self, _: &WpCursorShapeDeviceV1, _: <WpCursorShapeDeviceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-
-/// The cursor-shape-v1 shape for `c`, as `os_cursor` maps winit's. An image is the arrow.
-fn shape(c: crate::el::Cursor) -> Shape {
-    use crate::el::Cursor;
-    match c {
-        Cursor::Default | Cursor::Hidden | Cursor::Image(_) => Shape::Default,
-        Cursor::Pointer => Shape::Pointer,
-        Cursor::Text => Shape::Text,
-        Cursor::Grab => Shape::Grab,
-        Cursor::Grabbing => Shape::Grabbing,
-        Cursor::NotAllowed => Shape::NotAllowed,
-        Cursor::Move => Shape::Move,
-        Cursor::ResizeColumn => Shape::ColResize,
-        Cursor::ResizeRow => Shape::RowResize,
-        Cursor::Crosshair => Shape::Crosshair,
-        Cursor::Cell => Shape::Cell,
-        Cursor::ZoomIn => Shape::ZoomIn,
-        Cursor::ZoomOut => Shape::ZoomOut,
-    }
 }
 impl Dispatch<WlCallback, u64> for State {
     fn event(state: &mut Self, _: &WlCallback, event: wl_callback::Event, id: &u64, _: &Connection, _: &QueueHandle<Self>) {
@@ -511,85 +189,6 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             }
             _ => {}
         }
-    }
-}
-
-/// Wakes the event loop when an XWayland overlay's own X connection becomes readable.
-/// Wayland layer surfaces wake through winit's `set_wake_on_wayland_read` instead of a
-/// background reader thread.
-pub(crate) struct Watch {
-    stop: Arc<AtomicBool>,
-    /// How many times the overlay has dispatched, so the watcher waits for the loop to read
-    /// what woke it instead of spinning on a socket that stays readable until then.
-    turns: Arc<(Mutex<u64>, Condvar)>,
-}
-
-impl Watch {
-    #[allow(unsafe_code)]
-    pub(crate) fn spawn(fd: RawFd, wake: Waker) -> Watch {
-        let stop = Arc::new(AtomicBool::new(false));
-        let turns = Arc::new((Mutex::new(0u64), Condvar::new()));
-        let (stopped, seen) = (stop.clone(), turns.clone());
-        std::thread::Builder::new().name("rune-layer-watch".into()).spawn(move || {
-            while !stopped.load(Ordering::Acquire) {
-                let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                // SAFETY: one pollfd for a display socket. winit's outlives the event loop; an
-                // XWayland surface drops its watch before closing its connection, so at worst a
-                // reused descriptor wakes the loop once more before this thread stops.
-                let ret = unsafe { libc::poll(&mut poll, 1, 250) };
-                let result = if ret < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        connection::WatchPoll::Interrupted
-                    } else {
-                        connection::WatchPoll::Error
-                    }
-                } else if ret == 0 {
-                    connection::WatchPoll::TimedOut
-                } else {
-                    connection::WatchPoll::Ready {
-                        readable: poll.revents & libc::POLLIN != 0,
-                        hangup_or_error: poll.revents & (libc::POLLHUP | libc::POLLERR) != 0,
-                        invalid: poll.revents & libc::POLLNVAL != 0,
-                    }
-                };
-                match connection::watch_action(result) {
-                    connection::WatchAction::Continue => {}
-                    connection::WatchAction::Stop => break,
-                    connection::WatchAction::WakeAndStop => {
-                        if !stopped.load(Ordering::Acquire) { wake(); }
-                        break;
-                    }
-                    connection::WatchAction::Wake => {
-                        let (count, turned) = &*seen;
-                        let before = *count.lock().unwrap_or_else(|e| e.into_inner());
-                        wake();
-                        turned.wait_timeout_while(
-                            count.lock().unwrap_or_else(|e| e.into_inner()),
-                            Duration::from_millis(100),
-                            |n| *n == before && !stopped.load(Ordering::Acquire),
-                        ).ok();
-                    }
-                }
-            }
-        }).ok();
-        Watch { stop, turns }
-    }
-
-    pub(crate) fn turned(&self) {
-        let (count, turned) = &*self.turns;
-        *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        turned.notify_all();
-    }
-}
-
-impl Drop for Watch {
-    /// The thread notices immediately when parked, or within one poll timeout; joining would
-    /// stall hiding.
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let (count, turned) = &*self.turns;
-        let _guard = count.lock().unwrap_or_else(|e| e.into_inner());
-        turned.notify_all();
     }
 }
 
