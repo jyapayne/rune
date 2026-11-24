@@ -1,0 +1,1 @@
+- A Wayland layer-shell overlay tells AT-SPI when it gets and loses the keyboard, so a screen reader follows focus into it (a launcher's field, a panel's buttons); before, its window never read as focused and neither did anything in it.

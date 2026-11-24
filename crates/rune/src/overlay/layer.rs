@@ -141,6 +141,8 @@ impl OverlayCore {
             }
             Input::Focus(focused) => {
                 app.window_focus(focused);
+                // Assistive clients hear which window has the keys, and so where focus is.
+                if let Some(adapter) = self.surface.live_mut().and_then(|l| l.a11y.as_mut()) { adapter.focus(focused); }
                 if !focused && self.options.keys.takes_keys() {
                     self.ime.clear();
                     if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut()

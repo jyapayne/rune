@@ -71,7 +71,12 @@ impl OverlayCore {
         let shown = self.presence.shown();
         let Some(live) = self.surface.live_mut() else { return false };
         match crate::a11y::listing(crate::a11y::HIDDEN_LEAVES, shown, live.a11y.is_some()) {
-            crate::a11y::Listing::Join => live.a11y = self.shared.wake.lock().unwrap().clone().and_then(crate::a11y::Adapter::windowless),
+            crate::a11y::Listing::Join => {
+                live.a11y = self.shared.wake.lock().unwrap().clone().and_then(crate::a11y::Adapter::windowless);
+                // A surface that holds the keyboard as it shows says so to its new adapter.
+                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+                if let (Some(adapter), Backing::Layer(layer)) = (live.a11y.as_mut(), &live.backing) && layer.has_keyboard_focus() { adapter.focus(true); }
+            }
             crate::a11y::Listing::Leave => {
                 live.a11y = None;
                 rt.a11y_deactivate();
