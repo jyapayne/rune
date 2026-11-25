@@ -234,13 +234,11 @@ fn is_cjk(ch: char) -> bool {
         | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF)
 }
 
-/// Characters no font is looked up for: controls, joiners, bidi marks, variation selectors,
-/// tags and private-use icons (an app's icon font has them or nothing does).
+/// Characters no font is looked up for: controls, joiners, bidi marks, variation selectors and
+/// tags. Private-use icons are looked up: a window title or a shell prompt has Nerd Font icons
+/// that installed fonts have and the app's don't.
 fn needs_no_font(ch: char) -> bool {
-    ch.is_control()
-        || matches!(ch as u32,
-            0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F | 0xFE00..=0xFE0F | 0xFEFF | 0xE0000..=0xE0FFF
-            | 0xE000..=0xF8FF | 0xF0000..=0x10FFFF)
+    ch.is_control() || matches!(ch as u32, 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F | 0xFE00..=0xFE0F | 0xFEFF | 0xE0000..=0xE0FFF)
 }
 
 /// Interned family names: the symbol stack holds `&'static str`s, and the families a process

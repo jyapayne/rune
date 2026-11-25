@@ -519,6 +519,38 @@ fn emoji_draw_as_colour_images_beside_text() {
     assert_eq!(ts.color_pixels.len(), 1);
 }
 
+/// A character in no script of its own that no symbol family has (a Nerd Font icon in the
+/// private use area) shapes in an installed font that covers it, as fontconfig would pick for
+/// GTK, and braille and emoji beside it too: nothing draws as the missing glyph.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+#[test]
+fn unscripted_characters_use_an_installed_font_that_covers_them() {
+    let Ok(out) = std::process::Command::new("fc-list").args([":charset=e7a8", "family"]).output() else {
+        eprintln!("skipping: no fc-list");
+        return;
+    };
+    if out.stdout.is_empty() {
+        eprintln!("skipping: no installed font covers U+E7A8");
+        return;
+    }
+    let mut ts = TextSystem::default();
+    for text in ["π ⠹ \u{E7A8} ICED: build", "\u{E7A8}", "rust \u{E7A8} 🎉"] {
+        let layout = ts.layout_rich(text, &[], TextStyle::new(13.0, 400.0), 2.0, None);
+        let mut count = 0;
+        for line in layout.lines() {
+            for item in line.items() {
+                if let PositionedLayoutItem::GlyphRun(run) = item {
+                    for glyph in run.glyphs() {
+                        assert_ne!(glyph.id, 0, "missing glyph in {text:?}");
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert!(count >= text.chars().filter(|c| *c != ' ').count(), "{text:?}: {count} glyphs");
+    }
+}
+
 #[test]
 fn run_cells_draw_the_run_glyphs_and_marks_stay_with_their_base() {
     let mut ts = TextSystem::default();
