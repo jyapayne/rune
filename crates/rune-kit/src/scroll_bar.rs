@@ -69,6 +69,8 @@ const KEPT: usize = 256;
 pub struct ScrollBarStyle {
     thumb: Color,
     thumb_hover: Color,
+    /// The thumb's colour while a press holds it or the track; `thumb_hover` unless set.
+    thumb_held: Option<Color>,
     width: f32,
     hover_width: f32,
     track: Track,
@@ -89,6 +91,8 @@ struct Track {
     border: f32,
     /// Overlaid and faded at rest whatever the system preference.
     overlay: bool,
+    /// Shown whenever the content overflows whatever the system preference, as a classic bar.
+    always: bool,
     /// The strip sits beside the viewport, in room the caller leaves for it, rather than over
     /// its edge.
     gutter: bool,
@@ -124,6 +128,7 @@ const KIT_TRACK: Track = Track {
     min_thumb: MIN_THUMB,
     border: 0.0,
     overlay: false,
+    always: false,
     gutter: false,
     x: false,
     thumb_only: false,
@@ -149,6 +154,7 @@ const SCROLL_VIEW_TRACK: Track = Track {
     min_thumb: 32.0,
     border: 0.0,
     overlay: true,
+    always: false,
     gutter: false,
     x: false,
     thumb_only: true,
@@ -176,6 +182,7 @@ const NATIVE_TRACK: Track = Track {
     min_thumb: 32.0,
     border: 2.0,
     overlay: true,
+    always: false,
     gutter: true,
     x: false,
     thumb_only: false,
@@ -221,14 +228,14 @@ impl ScrollBarStyle {
     /// The kit's thumb: `border_base` and 6 points wide at rest, `border_strong` and 10 points
     /// under the pointer.
     pub fn from_kit(k: &Kit) -> Self {
-        Self { thumb: k.c.border_base, thumb_hover: k.c.border_strong, width: THUMB, hover_width: THUMB_HOVER, track: KIT_TRACK }
+        Self { thumb: k.c.border_base, thumb_hover: k.c.border_strong, thumb_held: None, width: THUMB, hover_width: THUMB_HOVER, track: KIT_TRACK }
     }
 
     /// `@opencode/ui`'s ScrollView thumb: always an overlay, hidden at rest and shown while the
     /// pointer is over the area or it scrolls; a 4 point `border_muted` pill that turns
     /// `border_strong` under the pointer or while dragged.
     pub fn scroll_view(k: &Kit) -> Self {
-        Self { thumb: k.c.border_muted, thumb_hover: k.c.border_strong, width: 4.0, hover_width: 4.0, track: SCROLL_VIEW_TRACK }
+        Self { thumb: k.c.border_muted, thumb_hover: k.c.border_strong, thumb_held: None, width: 4.0, hover_width: 4.0, track: SCROLL_VIEW_TRACK }
     }
 
     /// `@opencode/ui`'s `scrollbar.css`, the scroll bar of every plain `overflow: auto` box in
@@ -239,7 +246,7 @@ impl ScrollBarStyle {
     /// is over the thumb or drags it. It shows and hides at once. Pass `border_muted` and
     /// `border_strong`.
     pub fn native(thumb: Color, thumb_hover: Color) -> Self {
-        Self { thumb, thumb_hover, width: 4.0, hover_width: 4.0, track: NATIVE_TRACK }
+        Self { thumb, thumb_hover, thumb_held: None, width: 4.0, hover_width: 4.0, track: NATIVE_TRACK }
     }
 
     /// `@opencode/ui`'s MenuScroll thumb, for menus, popovers and dialog lists such as the
@@ -247,7 +254,7 @@ impl ScrollBarStyle {
     /// scrolls (and 800 ms after) or the thumb is held or under the pointer, and `thumb_hover`
     /// under the pointer or held. Pass `border_muted` and `border_strong`.
     pub fn menu_scroll(thumb: Color, thumb_hover: Color) -> Self {
-        Self { thumb, thumb_hover, width: 4.0, hover_width: 4.0, track: MENU_SCROLL_TRACK }
+        Self { thumb, thumb_hover, thumb_held: None, width: 4.0, hover_width: 4.0, track: MENU_SCROLL_TRACK }
     }
 
     /// A [`Self::native`] bar over the viewport's own end edge, in room its content leaves there,
@@ -256,6 +263,13 @@ impl ScrollBarStyle {
     /// content [`Self::strip`] of end padding while it overflows.
     pub fn inside(mut self) -> Self {
         self.track.gutter = false;
+        self
+    }
+
+    /// Shows the bar whenever the content overflows, as a classic scroll bar does, whatever the
+    /// user's "Show scroll bars" preference: for a desktop whose own look always draws its bars.
+    pub fn always_shown(mut self) -> Self {
+        (self.track.overlay, self.track.always) = (false, true);
         self
     }
 
@@ -305,6 +319,13 @@ impl ScrollBarStyle {
     /// The thumb's colour while the pointer is over the bar or holds the thumb.
     pub fn thumb_hover(mut self, c: Color) -> Self {
         self.thumb_hover = c;
+        self
+    }
+
+    /// The thumb's colour while a press holds it (dragging it, or paging from the track), rather
+    /// than [`Self::thumb_hover`]: an accent that says the bar has the pointer.
+    pub fn thumb_held(mut self, c: Color) -> Self {
+        self.thumb_held = Some(c);
         self
     }
 
@@ -544,7 +565,11 @@ impl Bar {
 
     fn thumb_fill(&self) -> Color {
         let style = self.style();
-        if self.wide() { style.thumb_hover } else { style.thumb }
+        match (self.pressed(), self.over.get()) {
+            (true, _) => style.thumb_held.unwrap_or(style.thumb_hover),
+            (false, true) => style.thumb_hover,
+            (false, false) => style.thumb,
+        }
     }
 
     /// Widens or narrows the thumb, and changes its colour, after the pointer or a press changed.
@@ -858,7 +883,7 @@ pub fn scroll_bar(k: &Kit, area: &str, key: &str, viewport: El) -> El {
 }
 
 fn attach(style: ScrollBarStyle, key: &str, outer: El, viewport: El) -> El {
-    let overlay = style.track.overlay || rune::system_scroll_bars().is_overlay(rune::system_scroller_overlay());
+    let overlay = !style.track.always && (style.track.overlay || rune::system_scroll_bars().is_overlay(rune::system_scroller_overlay()));
     let jumps = rune::system_scroller_jumps();
     let key = key.to_owned();
     let viewport = viewport.bind_path(move |viewport_path, patch| {

@@ -206,6 +206,42 @@ fn a_styled_thumb_takes_its_colours_and_widths_at_rest_and_under_the_pointer() {
 }
 
 #[test]
+fn a_held_thumb_takes_its_held_colour_and_an_always_shown_bar_stays_up_at_rest() {
+    const RED: rune::Color = rune::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+    const BLUE: rune::Color = rune::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 };
+    const GREEN: rune::Color = rune::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
+    fn held(_: &(), _: &mut rune::Cx<()>) -> El {
+        let style = ScrollBarStyle::neutral(true).thumb(RED).thumb_hover(BLUE).thumb_held(GREEN).always_shown();
+        col().size(200.0, 100.0).child(
+            col()
+                .key("scroll")
+                .w_full()
+                .h(100.0)
+                .scroll(rune::ScrollSpec { stick_bottom: false })
+                .child(col().children((0..20).map(|i| el().key(format!("row{i}")).w_full().h(20.0))))
+                .scroll_bar_styled(style),
+        )
+    }
+    let mut rt = rune::Runtime::new((), held, (200.0, 100.0), rune::Env::new(true, 1.0));
+    rt.set_system_scroll_bars(ScrollBars::WhenScrolling);
+    rt.check_live_only(false);
+    frames(&mut rt, 120);
+    assert_eq!(opacity(&rt, "scroll-bar"), 1.0, "shown at rest though the system overlays its bars");
+    let x = rect(&rt, "thumb")[0] + 3.0;
+    rt.pointer_move(x, 10.0);
+    frames(&mut rt, 30);
+    assert_eq!(info(&rt, "thumb").fill, BLUE, "the hover colour under the pointer");
+    rt.pointer_down(x, 10.0);
+    rt.pointer_move(x, 30.0);
+    frames(&mut rt, 30);
+    assert_eq!(info(&rt, "thumb").fill, GREEN, "the held colour while dragged");
+    rt.pointer_up(x, 30.0);
+    rt.pointer_move(100.0, 50.0);
+    frames(&mut rt, 120);
+    assert_eq!((info(&rt, "thumb").fill, opacity(&rt, "scroll-bar")), (RED, 1.0), "at rest again, and still shown");
+}
+
+#[test]
 fn the_pointer_at_the_right_edge_brings_up_an_overlay_bar() {
     let mut rt = rune::Runtime::new(20usize, hover_view, (200.0, 100.0), rune::Env::new(true, 1.0));
     rt.check_live_only(false);
