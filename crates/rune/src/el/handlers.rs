@@ -81,10 +81,11 @@ impl El {
     /// ```
     ///
     /// A drag-out element never runs its `on_drag`; a press released before the threshold still
-    /// runs `on_press`. macOS only for now: on other platforms the system drag doesn't start,
-    /// and the element behaves as if it had no `drag_out`. Headless tools record `drag-out
-    /// <path>` in the trace and `dragOut` in the tree instead. Overlay panels start the same
-    /// session; see [`crate::drag_out`] for how far that path is tested.
+    /// runs `on_press`. macOS, Windows and Wayland windows start the system drag; on X11 and in
+    /// Wayland overlays it doesn't start, and the element behaves as if it had no `drag_out`.
+    /// Headless tools record `drag-out <path>` in the trace and `dragOut` in the tree instead.
+    /// Overlay panels start the same session; see [`crate::drag_out`] for how far that path is
+    /// tested.
     pub fn drag_out<S: 'static>(mut self, f: impl Fn(&S) -> Option<crate::DragItem> + 'static) -> Self {
         self.handlers.drag_out = Some(Rc::new(move |s| f(s.cast::<S>().expect("handler registered for a different state type than the app's"))));
         self

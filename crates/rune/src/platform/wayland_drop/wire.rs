@@ -28,10 +28,14 @@ use super::machine::{
     SurfaceId, URI_LIST_MIME, WindowMap, WindowToken,
 };
 use super::pipe::{CancelToken, StopSignal, make_pipe, read_fd_bounded};
+use super::source::Pointer;
 use crate::machine::{Attempt, Seq};
 use crate::platform::layer_shell_machine::watch_loop;
 use crate::runtime::Waker;
 use crate::window::FileStep;
+
+mod drag;
+pub(crate) use drag::start_drag;
 
 thread_local! {
     /// One shared Wayland drop controller per `wl_display` pointer, always touched on the UI thread.
@@ -97,8 +101,13 @@ pub(crate) fn take(window: &winit::window::Window) -> Vec<FileStep> {
     })
 }
 
-#[allow(unsafe_code)]
 fn wayland_ids(window: &winit::window::Window) -> Option<(usize, SurfaceId)> {
+    wayland_surface(window).map(|(display, id)| (display, id.protocol_id()))
+}
+
+/// The window's `wl_display` pointer and its `wl_surface`'s object.
+#[allow(unsafe_code)]
+fn wayland_surface(window: &winit::window::Window) -> Option<(usize, ObjectId)> {
     let (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(handle)) = (
         window.display_handle().ok()?.as_raw(),
         window.window_handle().ok()?.as_raw(),
@@ -107,7 +116,7 @@ fn wayland_ids(window: &winit::window::Window) -> Option<(usize, SurfaceId)> {
     };
     // SAFETY: `handle.surface` is the live `wl_surface` proxy winit owns for `window`.
     let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), handle.surface.as_ptr().cast()) }.ok()?;
-    Some((display.display.as_ptr() as usize, id.protocol_id()))
+    Some((display.display.as_ptr() as usize, id))
 }
 
 /// Shared wake handle pointing to all currently registered windows on one display; calling `wake`
@@ -271,10 +280,16 @@ struct SeatDevice {
     device: WlDataDevice,
     pending: OfferSet,
     state: State,
+    /// This client's own `wl_pointer` on the seat, for the press serial a drag starts with.
+    pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
+    pointing: Pointer,
 }
 
 struct QueueState {
     manager: Option<WlDataDeviceManager>,
+    compositor: Option<wayland_client::protocol::wl_compositor::WlCompositor>,
+    shm: Option<wayland_client::protocol::wl_shm::WlShm>,
+    drag: Option<drag::ActiveDrag>,
     seats: HashMap<u32, SeatDevice>,
     offers: HashMap<OfferId, WlDataOffer>,
     offer_seat: HashMap<OfferId, u32>,
@@ -291,6 +306,9 @@ impl QueueState {
     fn new(reply_tx: mpsc::Sender<WorkerReply>, wakers: WakePool) -> Self {
         Self {
             manager: None,
+            compositor: None,
+            shm: None,
+            drag: None,
             seats: HashMap::new(),
             offers: HashMap::new(),
             offer_seat: HashMap::new(),
@@ -318,6 +336,8 @@ impl QueueState {
             device,
             pending: OfferSet::default(),
             state: State::Idle,
+            pointer: None,
+            pointing: Pointer::Away,
         });
         self.needs_flush = true;
     }
@@ -328,6 +348,7 @@ impl QueueState {
         };
         let effects = machine::step(&mut self.seq, &mut seat_dev.state, Event::Gone);
         self.apply_effects(name, effects);
+        self.drag_seat_gone(name);
         for offer_id in seat_dev.pending.drain_ids() {
             self.destroy_offer(offer_id);
         }
@@ -336,6 +357,9 @@ impl QueueState {
             seat_dev.device.release();
         } else {
             backend.destroy_object(&seat_dev.device.id()).ok();
+        }
+        if let Some(pointer) = seat_dev.pointer.take() {
+            drag::release_pointer(pointer, &backend);
         }
         if seat_dev.seat.version() >= 5 {
             seat_dev.seat.release();
@@ -487,13 +511,16 @@ impl Dispatch<WlDataDeviceManager, ()> for QueueState {
 
 impl Dispatch<WlSeat, u32> for QueueState {
     fn event(
-        _: &mut Self,
-        _: &WlSeat,
-        _: wl_seat::Event,
-        _: &u32,
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        name: &u32,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
     ) {
+        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+            state.seat_capabilities(seat, *name, caps, conn, qh);
+        }
     }
 }
 
@@ -526,7 +553,8 @@ impl Dispatch<WlDataDevice, u32> for QueueState {
             }
             wl_data_device::Event::Enter { serial, surface, x, y, id } => {
                 let surface_id = surface.id().protocol_id();
-                let target = state.windows.token(surface_id);
+                // A drag out of this app reaches its own windows only when it says so.
+                let target = state.windows.token(surface_id).filter(|_| state.own_drag_drops_here());
                 let offer = id.and_then(|o| {
                     let offer_id = o.id().protocol_id();
                     state.seats.get_mut(&seat_name).and_then(|s| s.pending.take(offer_id))
@@ -652,6 +680,8 @@ impl Controller {
             return None;
         };
         state.manager = Some(manager);
+        state.compositor = globals.bind(&qh, 1..=4, ()).ok();
+        state.shm = globals.bind(&qh, 1..=1, ()).ok();
         let initial_seats: Vec<(u32, u32)> = globals
             .contents()
             .clone_list()
@@ -732,6 +762,7 @@ impl Drop for Controller {
             cancel.cancel();
         }
         drain_event_queue(&mut self.queue, &mut self.state);
+        self.state.end_drag(super::source::Event::Gone);
         let seat_names: Vec<u32> = self.state.seats.keys().copied().collect();
         for seat_name in seat_names {
             self.state.remove_seat(seat_name, &self.conn);
@@ -741,8 +772,9 @@ impl Drop for Controller {
         }
         self.state.offer_seat.clear();
         let backend = self.conn.backend();
-        if let Some(manager) = self.state.manager.take() {
-            backend.destroy_object(&manager.id()).ok();
+        let proxies = [self.state.manager.take().map(|p| p.id()), self.state.compositor.take().map(|p| p.id()), self.state.shm.take().map(|p| p.id())];
+        for id in proxies.into_iter().flatten() {
+            backend.destroy_object(&id).ok();
         }
         if let Some(globals) = self.globals.take() {
             destroy_globals(&self.conn, globals);

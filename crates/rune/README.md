@@ -1749,9 +1749,14 @@ the element unless `DragItem::image` sets one. `on_drag_end` receives `DragOutco
 `DragItem::within_app` offers it to them: their `on_drop_files` targets then receive the files
 as they would from Finder (an image dragged from a list into a composer).
 
-macOS only for now. Elsewhere `drag_out` is ignored and the element keeps its press and
-`on_drag` behaviour. Headless runs record `drag-out <path>` in `--trace` and mark the node
-`dragOut` in `--tree`. `examples/drag-out` drags a file, an app and some text.
+macOS, Windows and Wayland windows start the system drag. On Wayland files go as
+`text/uri-list`, text as `text/plain;charset=utf-8` and PNG data as `image/png`, the picture
+rides along as the drag icon, and `DragOperation::Ask` lets the target ask whether to copy or
+move (a Copy/Move menu in GTK file managers). Hyprland tells the source no action, so there a
+drag that dropped ends `Copied` even when the target moved the file. On X11 and in Wayland
+overlays `drag_out` is ignored and the element keeps its press and `on_drag` behaviour.
+Headless runs record `drag-out <path>` in `--trace` and mark the node `dragOut` in `--tree`.
+`examples/drag-out` drags a file, an app and some text.
 
 ### Dropping files in from other apps (`on_drop_files`)
 

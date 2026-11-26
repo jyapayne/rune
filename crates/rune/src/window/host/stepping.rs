@@ -162,6 +162,8 @@ impl Host {
                 &w.window,
                 std::sync::Arc::new(move || handle.send(|_| crate::window::WakeEvent::FileDrop)),
             );
+            // The same `wl_data_device` starts drags out of the window.
+            self.app.rt_mut().set_os_drag(w.native.drop_target.is_some());
         }
         #[cfg(not(target_arch = "wasm32"))]
         crate::platform::ready_signal::ready();
