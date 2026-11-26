@@ -116,6 +116,8 @@ impl Host {
             presented: None,
             redraw: std::cell::Cell::new(Redraw::Idle),
         });
+        // A portal's dialog belongs to the window of the app that asked for it.
+        if let Some(w) = self.win.as_mut() { w.native.foreign_parent = crate::platform::foreign_parent::Bond::new(&w.window); }
         self.apply_placement(event_loop);
         crate::marks::mark("window.created");
         if let Some(created) = self.on_created.take() { created(self.native_handle.clone()); }
