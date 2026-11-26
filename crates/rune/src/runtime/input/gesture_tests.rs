@@ -171,3 +171,45 @@ fn a_sideways_wheel_over_a_bar_scrolls_the_viewport_it_follows() {
         assert_eq!(along.scroll.scrolls[&id].x.offset, 40.0, "the sideways wheel over the table's own bar scrolled the table");
     }
 }
+
+/// A root that hears the back and forward buttons, over a row that takes presses and a canvas
+/// that takes the back button itself.
+#[derive(Default)]
+struct Buttons { back: u32, forward: u32, row: u32, canvas: u32 }
+
+fn buttons(_: &Buttons, _: &mut crate::Cx<Buttons>) -> El {
+    el().key("root").size(300.0, 200.0)
+        .on_button_down([PointerButton::Back, PointerButton::Forward], |s: &mut Buttons, tx| match tx.button() {
+            PointerButton::Back => s.back += 1,
+            _ => s.forward += 1,
+        })
+        .child(el().key("row").size(100.0, 40.0).on_press(|s: &mut Buttons| s.row += 1))
+        .child(el().key("canvas").absolute(200.0, 0.0).size(100.0, 100.0).pointer_buttons([PointerButton::Back]).on_press(|s: &mut Buttons| s.canvas += 1))
+}
+
+#[test]
+fn on_button_down_hears_its_buttons_over_descendants_that_do_not_take_them() {
+    let mut rt = Runtime::new(Buttons::default(), buttons, (300.0, 200.0), Env { system_dark: false, scale: 1.0 });
+    rt.frame(0.0);
+    for (x, y, button) in [(50.0, 20.0, PointerButton::Back), (50.0, 150.0, PointerButton::Forward)] {
+        rt.button_down(x, y, button);
+        rt.button_up(x, y, button);
+        rt.frame(0.0);
+    }
+    assert_eq!((rt.state.back, rt.state.forward, rt.state.row), (1, 1, 0), "over the row and over empty space");
+    rt.button_down(250.0, 50.0, PointerButton::Back);
+    rt.button_up(250.0, 50.0, PointerButton::Back);
+    rt.frame(0.0);
+    assert_eq!((rt.state.back, rt.state.canvas), (1, 1), "a deeper element taking the button keeps it");
+}
+
+#[test]
+fn on_button_down_leaves_the_primary_button_alone() {
+    let mut rt = Runtime::new(Buttons::default(), buttons, (300.0, 200.0), Env { system_dark: false, scale: 1.0 });
+    rt.frame(0.0);
+    rt.pointer_down(50.0, 150.0);
+    rt.pointer_up(50.0, 150.0);
+    rt.frame(0.0);
+    assert_eq!((rt.state.back, rt.state.forward), (0, 0));
+    assert!(rt.element_at(50.0, 150.0).is_some_and(|p| p.key() == Some("root")));
+}

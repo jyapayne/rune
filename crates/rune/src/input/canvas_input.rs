@@ -127,6 +127,7 @@ type WheelFn = Rc<dyn Fn(crate::states::States<'_>, WheelEvent, &mut Tx) -> bool
 type MagnifyFn = Rc<dyn Fn(crate::states::States<'_>, MagnifyEvent, &mut Tx) -> bool>;
 type RotateFn = Rc<dyn Fn(crate::states::States<'_>, RotateEvent, &mut Tx) -> bool>;
 type SmartMagnifyFn = Rc<dyn Fn(crate::states::States<'_>, f32, f32, &mut Tx) -> bool>;
+type ButtonDownFn = Rc<dyn Fn(crate::states::States<'_>, &mut Tx)>;
 
 /// An element's canvas handlers, boxed: few elements have any.
 #[derive(Clone, Default)]
@@ -137,6 +138,9 @@ pub(crate) struct CanvasInput {
     pub smart_magnify: Option<SmartMagnifyFn>,
     /// [`PointerButton::bit`]s of the buttons besides the primary that press and drag it.
     pub buttons: u8,
+    /// [`El::on_button_down`]: the bits of the buttons it hears, and the handler.
+    pub down: u8,
+    pub button_down: Option<ButtonDownFn>,
 }
 
 impl CanvasInput {
@@ -202,6 +206,22 @@ impl El {
         self
     }
 
+    /// Runs when one of `buttons` (any but the primary and secondary) goes down over this
+    /// element or over a descendant that doesn't take that button itself, with [`Tx::button`]
+    /// saying which: the mouse's back and forward buttons going back and forward in a file
+    /// manager or a browser, wherever the pointer is in its window. The innermost element
+    /// there that takes the button gets it, whether it took it this way, with
+    /// [`El::pointer_buttons`] or as a middle click. Unlike `pointer_buttons` with `on_press`,
+    /// it claims no other button: the element doesn't become a target for primary presses, so
+    /// a window's root can carry it without its empty space taking clicks (and focus) away.
+    pub fn on_button_down<S: 'static>(mut self, buttons: impl IntoIterator<Item = PointerButton>, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        let bits = buttons.into_iter().filter(|b| !matches!(b, PointerButton::Primary | PointerButton::Secondary)).fold(0, |bits, b| bits | b.bit());
+        let input = self.canvas_input();
+        input.down |= bits;
+        input.button_down = Some(Rc::new(move |s, tx| f(state::<S>(s), tx)));
+        self
+    }
+
     /// Key releases. A release goes to the focused element's handler, then each ancestor's up
     /// to the root; with nothing focused, to the root's (or an open modal's), so a handler on a
     /// window's root hears every release nothing else took. Return true to take it. The key is
@@ -217,6 +237,7 @@ impl Tx {
     /// In `on_press` and `on_drag`, the button that drove it, which is
     /// [`PointerButton::Primary`] unless the element opted in to others with
     /// [`El::pointer_buttons`]; in `on_link`, `Middle` for a middle click on the link; in
-    /// [`El::on_middle_press`], `Middle`. Other handlers see `Primary`.
+    /// [`El::on_middle_press`], `Middle`; in [`El::on_button_down`], the button that went
+    /// down. Other handlers see `Primary`.
     pub fn button(&self) -> PointerButton { self.button }
 }

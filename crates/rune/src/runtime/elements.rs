@@ -535,17 +535,20 @@ impl RuntimeCore {
             Some(key) => Some(self.tree.selects_index(key)?),
             None => None,
         };
+        self.element_index_at(scope, x, y, pick).map(|i| Picked {
+            path: self.tree.nodes[i].path.clone(),
+            key: self.tree.nodes[i].key.clone(),
+        })
+    }
+
+    /// The index of the topmost element drawn at (`x`, `y`) inside `scope` (anywhere when
+    /// `None`), with or without handlers, as [`Runtime::element_at`] finds it.
+    pub(in crate::runtime) fn element_index_at(&self, scope: Option<usize>, x: f32, y: f32, pick: Pick) -> Option<usize> {
         let n = self.tree.nodes.len();
         let order = self.paint.layer_paint_order();
         let at = |k: usize| if order.is_empty() { k } else { order[k] };
         let count = if order.is_empty() { n } else { order.len() };
-        (0..count).rev().map(at).find(|&i| {
-            scope.is_none_or(|scope| self.tree.is_descendant(i, scope))
-                && self.pickable(i, x, y, pick)
-        }).map(|i| Picked {
-            path: self.tree.nodes[i].path.clone(),
-            key: self.tree.nodes[i].key.clone(),
-        })
+        (0..count).rev().map(at).find(|&i| scope.is_none_or(|scope| self.tree.is_descendant(i, scope)) && self.pickable(i, x, y, pick))
     }
 
     /// Whether window point (`x`, `y`), in points, is inside the drawn, clipped and turned box

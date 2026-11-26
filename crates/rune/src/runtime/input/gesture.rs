@@ -262,6 +262,14 @@ impl RuntimeCore {
                 if let Some(k) = self.middle_link_at(i, x, y) { return Some((i, Some(k))); }
                 h.on_middle_press.is_some().then_some((i, None))
             });
+        // An element hearing the button with `on_button_down` takes it unless a deeper one
+        // takes it as a press, a drag or a middle click.
+        if let Some(d) = self.button_down_at(x, y, button)
+            && target.is_none_or(|(t, _)| t != d && self.tree.is_descendant(d, t))
+        {
+            self.frame.queue.push(Action::ButtonDown(self.tree.nodes[d].path.clone(), button));
+            return;
+        }
         let Some((i, link)) = target else {
             if middle { self.autoscroll_down(x, y); }
             return;
@@ -276,6 +284,15 @@ impl RuntimeCore {
         self.pointer.clear_press_clicks();
         let now = self.now_clock();
         self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link).drag_handler(drag_handler));
+    }
+
+    /// The innermost element at (x, y) or around it, drawn whether or not it takes presses,
+    /// whose [`El::on_button_down`] hears `button`.
+    fn button_down_at(&self, x: f32, y: f32, button: PointerButton) -> Option<usize> {
+        let top = self.element_index_at(None, x, y, crate::Pick::default())?;
+        std::iter::successors(Some(top), |&i| self.tree.nodes[i].parent)
+            .take_while(|&i| !self.subtree_exiting(i) && self.allowed(i))
+            .find(|&i| self.tree.nodes[i].handlers.gestures.as_ref().is_some_and(|g| g.button_down.is_some() && g.down & button.bit() != 0))
     }
 
     /// Element `i` opted in to `button` ([`El::pointer_buttons`]); every element takes the

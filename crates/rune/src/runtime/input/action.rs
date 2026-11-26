@@ -28,6 +28,8 @@ pub(in crate::runtime) enum Action {
     DoublePress(String),
     /// `El::on_middle_press`.
     MiddlePress(String),
+    /// `El::on_button_down`, and the button that went down.
+    ButtonDown(String, crate::PointerButton),
     /// A text's link and the button that clicked it (the primary or the middle).
     Link(String, usize, crate::PointerButton),
     /// `El::on_link_secondary`: the text, its link and the press.
@@ -145,6 +147,7 @@ pub(in crate::runtime) fn live_only_handler(action: &Action) -> Option<&'static 
         Action::Press(..) => "on_press",
         Action::DoublePress(_) => "on_double_press",
         Action::MiddlePress(_) => "on_middle_press",
+        Action::ButtonDown(..) => "on_button_down",
         Action::Link(..) => "on_link",
         Action::LinkSecondary(..) => "on_link_secondary",
         Action::SecondaryPress(..) => "on_secondary_press",
@@ -164,7 +167,7 @@ pub(in crate::runtime) fn live_only_handler(action: &Action) -> Option<&'static 
 #[cfg(debug_assertions)]
 pub(in crate::runtime) fn action_path(action: &Action) -> Option<&str> {
     match action {
-        Action::PointerMove(path, _) | Action::DrawnLayout(path, ..) | Action::Layout(path, _) | Action::Hover(path) | Action::HoverChange(path, _) | Action::SelectionChange(path, _) | Action::Press(path, ..) | Action::DoublePress(path) | Action::MiddlePress(path)
+        Action::PointerMove(path, _) | Action::DrawnLayout(path, ..) | Action::Layout(path, _) | Action::Hover(path) | Action::HoverChange(path, _) | Action::SelectionChange(path, _) | Action::Press(path, ..) | Action::DoublePress(path) | Action::MiddlePress(path) | Action::ButtonDown(path, _)
         | Action::Link(path, ..) | Action::LinkSecondary(path, ..) | Action::SecondaryPress(path, _) | Action::Drag(path, ..) | Action::DragRepeat(path, ..) | Action::DragStart(path)
         | Action::DragEnd(path, _) | Action::Visible(path, _) => Some(path),
         Action::Wheel { chain, .. } => chain.as_deref().and_then(|c| c.first()).map(String::as_str),
@@ -446,6 +449,13 @@ impl RuntimeCore {
                 f(app.states(), &mut one);
                 true
             }
+            Action::ButtonDown(path, button) => {
+                let Some(f) = self.node(&path).and_then(|n| n.handlers.gestures.as_ref()?.button_down.clone()) else { return false };
+                log_event!(self, "button down {path}");
+                one.button = button;
+                f(app.states(), &mut one);
+                true
+            }
             Action::Link(path, k, button) => {
                 one.button = button;
                 self.press_link(app, &path, k, &mut one)
@@ -588,7 +598,7 @@ fn reads_text_layout(action: &Action) -> bool {
             Key::Modifier { .. } => false,
             _ => true,
         },
-        Action::Press(..) | Action::DoublePress(..) | Action::MiddlePress(..) | Action::SecondaryPress(..) | Action::Drag(..) | Action::DragStart(..) => true,
+        Action::Press(..) | Action::DoublePress(..) | Action::MiddlePress(..) | Action::ButtonDown(..) | Action::SecondaryPress(..) | Action::Drag(..) | Action::DragStart(..) => true,
         _ => false,
     }
 }
