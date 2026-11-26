@@ -12,6 +12,7 @@ pub(crate) mod display_link_machine;
 pub mod embed;
 #[cfg(any(test, target_vendor = "apple"))]
 pub(crate) mod embed_frame;
+pub(crate) mod foreign_parent;
 pub(crate) mod ime;
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
 pub(crate) mod layer_shell;

@@ -429,6 +429,9 @@ impl Host {
             covered_draw: CoveredDraw::Current,
             redraw: std::cell::Cell::new(Redraw::Idle),
         });
+        // A portal's dialog belongs to the window of the app that asked for it.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(w) = self.win.as_mut() { w.native.foreign_parent = crate::platform::foreign_parent::Bond::new(&w.window); }
         if launcher { self.win.as_mut().unwrap().first_frame.prepare(crate::time::now()); }
         self.apply_placement(event_loop);
         #[cfg(target_os = "macos")]

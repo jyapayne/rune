@@ -227,6 +227,7 @@ pub use platform::app_icon::set_app_icon;
 pub use platform::app_icon::set_app_icon_resource;
 #[cfg(target_vendor = "apple")]
 pub use platform::embed;
+pub use platform::foreign_parent::set_parent_window;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use platform::macos::appearance as macos_appearance;

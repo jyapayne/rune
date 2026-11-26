@@ -78,6 +78,9 @@ pub(in crate::window) struct Native {
     pub(in crate::window) mode: crate::window::linux::handover::SurfaceMode,
     /// Unregisters the window's Wayland drop target before the window's `wl_surface` drops.
     pub(in crate::window) drop_target: Option<crate::platform::wayland_drop::DropTarget>,
+    /// Ties the window to another app's window (`rune::set_parent_window`); dropped before
+    /// the window's `wl_surface`.
+    pub(in crate::window) foreign_parent: Option<crate::platform::foreign_parent::Bond>,
 }
 
 #[cfg(target_os = "windows")]
