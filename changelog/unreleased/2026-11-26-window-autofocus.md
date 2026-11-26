@@ -1,0 +1,1 @@
+- `El::autofocus` works outside a modal too, as HTML's `autofocus` on a page: until anything in a window has had focus, the first shown, focusable `autofocus` control takes it as it shows, without a ring (a save dialog opens with the keyboard in its name field). Once anything has had focus it never runs again; a modal's `autofocus` still runs each time the modal opens.

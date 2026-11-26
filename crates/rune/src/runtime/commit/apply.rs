@@ -565,6 +565,7 @@ impl RuntimeCore {
         self.subscribe_live();
         if let Some(path) = rebound_press { self.pointer.rebind_press_path(&path); }
         self.sync_modals(app);
+        self.sync_window_autofocus(app);
         self.sync_held_drag();
         self.sync_follows(app);
         self.motion.sync_loops(&self.tree.nodes, &self.scene, self.t, self.clock, self.time_scale, time_scaled, any_loop, tx.commit.lands() || self.reduced_motion);
