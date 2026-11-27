@@ -426,3 +426,66 @@ fn focused_link_shows_its_help_under_its_glyphs_when_on_focus_is_enabled() {
     press(&mut off, Key::Tab, false);
     assert!(off.help_tooltip().is_none(), "on_focus(false) keeps link focus tooltips off");
 }
+
+/// A wide row with help, as a file manager's details row is, in a look that is or isn't
+/// `at_pointer`, with a title font for a first row of several or none.
+#[derive(Clone, Copy)]
+struct Wide { at_pointer: bool, title: bool }
+
+fn wide(s: &Wide, cx: &mut Cx<Wide>) -> El {
+    let look = crate::HelpLook::system(true).at_pointer(s.at_pointer).max_width(Some(200.0));
+    cx.help_look(if s.title { look.title(crate::TextStyle::new(20.0, 700.0).lh(26.0)) } else { look });
+    let long = "x".repeat(120);
+    el().w_full().h_full()
+        .child(el().key("row").size(380.0, 30.0).pin(Some(10.0), Some(10.0), None, None).help("Report.pdf").help_row("PDF document"))
+        .child(el().key("long").size(380.0, 30.0).pin(Some(10.0), Some(100.0), None, None).help(long))
+}
+
+fn wide_tip(s: Wide, x: f32, y: f32) -> Option<[f32; 4]> {
+    let mut rt = Runtime::new(s, wide, (400.0, 300.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    rt.pointer_move(x, y);
+    rt.frame(1.0 / 60.0);
+    rt.frame(rt.help_delay + 0.1);
+    rt.help_tooltip().map(|(_, r)| r)
+}
+
+#[test]
+fn a_tooltip_at_the_pointer_hangs_under_where_the_pointer_rested_not_under_its_element() {
+    let under = wide_tip(Wide { at_pointer: false, title: false }, 340.0, 20.0).expect("tooltip shown");
+    assert!((under[0] + under[2] / 2.0 - 200.0).abs() < 1.0, "centred under the row: {under:?}");
+    let at = wide_tip(Wide { at_pointer: true, title: false }, 340.0, 20.0).expect("tooltip shown");
+    assert!((at[0] + at[2] / 2.0 - 340.0).abs() < 1.0 || at[0] + at[2] == 396.0, "centred under the pointer, or kept inside the window: {at:?}");
+    assert!(at[1] >= 20.0 + super::POINTER, "clear of the pointer's arrow: {at:?}");
+}
+
+#[test]
+fn a_word_wider_than_the_tooltip_wraps_inside_it() {
+    let tip = wide_tip(Wide { at_pointer: false, title: false }, 200.0, 110.0).expect("tooltip shown");
+    assert!(tip[2] <= 200.0 + 2.0 * 7.0, "no wider than the look's widest and its padding: {tip:?}");
+    assert!(tip[3] > 40.0, "on several lines: {tip:?}");
+}
+
+#[test]
+fn a_title_font_sets_the_first_of_several_rows() {
+    let plain = wide_tip(Wide { at_pointer: false, title: false }, 200.0, 20.0).expect("tooltip shown");
+    let titled = wide_tip(Wide { at_pointer: false, title: true }, 200.0, 20.0).expect("tooltip shown");
+    assert!(titled[3] >= plain[3] + 8.0, "the name's line is taller: {plain:?} -> {titled:?}");
+}
+
+#[test]
+fn files_dragged_over_a_help_element_show_no_tooltip() {
+    let mut rt = Runtime::new(Wide { at_pointer: true, title: false }, wide, (400.0, 300.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    rt.pointer_move(200.0, 20.0);
+    rt.drag_files(vec![std::path::PathBuf::from("a.png")], Some((200.0, 20.0)));
+    rt.frame(1.0 / 60.0);
+    rt.frame(rt.help_delay + 0.1);
+    assert!(rt.help_tooltip().is_none());
+    rt.drag_files_leave();
+    rt.frame(rt.help_delay + 0.2);
+    rt.pointer_move(201.0, 20.0);
+    rt.frame(rt.help_delay + 0.3);
+    rt.frame(2.0 * rt.help_delay + 0.4);
+    assert!(rt.help_tooltip().is_some(), "after the drag, resting shows it again");
+}

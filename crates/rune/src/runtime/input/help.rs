@@ -19,6 +19,10 @@ use crate::machine::Effects;
 
 use super::*;
 
+/// How far under the pointer's hot spot a tooltip at the pointer (`HelpLook::at_pointer`)
+/// hangs from, before the look's gap: clear of the arrow, as Qt's tooltips sit 16 px down.
+const POINTER: f32 = 16.0;
+
 #[derive(Default)]
 pub(in crate::runtime) struct HelpState {
     state: Tip,
@@ -31,6 +35,8 @@ pub(in crate::runtime) struct HelpState {
     /// The host shows system tooltips from `help_regions`.
     native: bool,
     regions: Vec<([f32; 4], String)>,
+    /// When (clock seconds) the open tooltip opened, and where the pointer was then.
+    at: Option<(f64, Option<(f32, f32)>)>,
 }
 
 /// A help element, or one link of its text, by path.
@@ -384,6 +390,8 @@ impl RuntimeCore {
         // A menu is up or about to open and has the pointer: the element it came from keeps
         // its tooltip hidden.
         if !self.host.popups.is_empty() { return (self.pointer.help.state.target().cloned().map_or(Over::Away, Over::Covered), None); }
+        // Files dragged over the window are on their way somewhere: nothing they pass explains itself.
+        if self.pointer.dragging_files() { return (Over::Away, None); }
         let Some((x, y)) = self.pointer.pos.filter(|&(x, y)| self.in_viewport(x, y)) else { return (Over::Away, None) };
         let target = |i: usize, link| Target { path: self.tree.nodes[i].path.clone(), link };
         // While moving layout holds hover, the tooltip keeps its element, and nothing sliding
@@ -458,6 +466,9 @@ impl RuntimeCore {
         if let Tip::Open { target, since } = &self.pointer.help.state {
             let (link, since) = (target.link, *since);
             let node = under.or_else(|| self.hover_live(&target.path));
+            if self.pointer.help.at.is_none_or(|(opened, _)| opened.to_bits() != since.to_bits()) {
+                self.pointer.help.at = Some((since, self.pointer.pos));
+            }
             if let Some(i) = node && let Some(text) = self.help_text(i, link).cloned() {
                 let e = self.drawn_box(i);
                 let anchor = link.and_then(|k| self.link_boxes_for(i, k, e).into_iter().map(|(_, r)| r)
@@ -470,9 +481,13 @@ impl RuntimeCore {
                     }
                 } else {
                     let side = link.is_none().then(|| self.tree.nodes[i].cold.get().and_then(|c| c.help_side)).flatten();
+                    // At the pointer (`HelpLook::at_pointer`): where it rested inside the element as the tooltip opened.
+                    let pointer = self.pointer.help.at.and_then(|(_, at)| at)
+                        .filter(|&(x, y)| look.at_pointer && link.is_none() && side.is_none() && x >= e[0] && x < e[2] && y >= e[1] && y < e[3]);
+                    let anchor = pointer.map_or(box_rect, |(x, y)| [x, y, x + 1.0, y + POINTER]);
                     let t = if motion && look.fade[0] > 0.0 { ((self.clock - since) / look.fade[0]) as f32 } else { 1.0 };
                     let e_in = rune_motion::Easing::EASE_OUT.eval(t.clamp(0.0, 1.0));
-                    let d = Drawn { text, anchor: box_rect, side, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
+                    let d = Drawn { text, anchor, side, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
                     let [x, y, w, h] = self.draw_tooltip(&d);
                     self.pointer.help.tip = Some((crate::el::help_words(&d.text).into_owned(), [x, y, w, h]));
                     self.pointer.help.drawn = Some(d);
@@ -499,7 +514,8 @@ impl RuntimeCore {
         let wrap = look.max_w.unwrap_or(vw - 2.0 * margin - 2.0 * pad_x).max(1.0);
         // Each row (`El::help_row`) is its words, then its keycaps.
         let mut rows = Vec::new();
-        for row in d.text.split(crate::el::HELP_ROW) {
+        let several = d.text.contains(crate::el::HELP_ROW);
+        for (n, row) in d.text.split(crate::el::HELP_ROW).enumerate() {
             let mut parts = row.split(crate::el::HELP_KEY);
             let words = parts.next().unwrap_or_default();
             let caps: Vec<_> = parts.map(|k| {
@@ -511,7 +527,9 @@ impl RuntimeCore {
             let keys_w = if caps.is_empty() { 0.0 } else {
                 caps.iter().map(|(_, w)| w).sum::<f32>() + key.gap * (caps.len() - 1) as f32 + if words.is_empty() { 0.0 } else { key.lead }
             };
-            let layout = self.text.layout_rich(words, &[], look.font, s, Some((wrap - keys_w).max(1.0) * s));
+            // A word wider than the tooltip (a long file name, a path) breaks inside rather than running out of it.
+            let font = if n == 0 && several { look.title.unwrap_or(look.font) } else { look.font };
+            let layout = self.text.layout_rich_with(words, &[], font, s, Some((wrap - keys_w).max(1.0) * s), crate::text::RichLayoutOptions::new().wrap_anywhere());
             let (tw, th) = if words.is_empty() { (0.0, 0.0) } else { ((layout.full_width() / s).ceil(), (layout.height() / s).ceil()) };
             let ch = if caps.is_empty() { th } else { th.max(key.height) };
             rows.push(TipRow { words: !words.is_empty(), layout, tw, th, ch, caps, keys_w });

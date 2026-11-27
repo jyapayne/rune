@@ -38,6 +38,10 @@ pub struct HelpLook {
     pub(crate) row_gap: f32,
     /// The line of text the tooltip sits on (`HelpLook::sit_on_line`).
     pub(crate) line: Option<TextStyle>,
+    /// A tooltip hangs under the pointer where it opened (`HelpLook::at_pointer`).
+    pub(crate) at_pointer: bool,
+    /// The first of several rows' font (`HelpLook::title`).
+    pub(crate) title: Option<TextStyle>,
 }
 
 /// How a tooltip draws its keycaps.
@@ -96,7 +100,24 @@ impl HelpLook {
             },
             row_gap: 4.0,
             line: None,
+            at_pointer: false,
+            title: None,
         }
+    }
+    /// A tooltip the pointer opened hangs under the pointer where it opened, as Qt's and
+    /// Dolphin's do, rather than under its element: right for a long row or a big cell,
+    /// whose middle may be far from the pointer. A tooltip the keyboard opened, or one on a
+    /// side of its own ([`El::help_side`](crate::El::help_side)) or on a link, still hangs
+    /// from its element.
+    pub fn at_pointer(mut self, on: bool) -> Self {
+        self.at_pointer = on;
+        self
+    }
+    /// The first row of a tooltip with several ([`El::help_row`](crate::El::help_row)) in
+    /// `font`, as Dolphin's tooltip sets a file's name in bold over its details.
+    pub fn title(mut self, font: TextStyle) -> Self {
+        self.title = Some(font);
+        self
     }
     /// The tooltip sits on a line of `strut` text, as a web tooltip that is `display:
     /// inline-flex` inside its positioner's block does: under its element it drops until its
