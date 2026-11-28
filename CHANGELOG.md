@@ -5,6 +5,8 @@ without a code change (goldens, layout, input), newest first, with the rev that 
 
 ## dev
 
+- `--snap` and `--video` no longer stop with "a frame's readback failed" (exit 2) now and then when another thread polls the same device, as a video surface's completion worker does: a readback whose answer that thread is still delivering is waited for, up to 5 s after the GPU finished, and a failed one still stops the run.
+
 - `RollingText` now remembers at most 512 labels (and 256 KiB of text) per thread, dropping the least recently built; a label that comes back after that starts its roll over (t841).
 
 - Docs: a "Fast apps" page (rules with before and after snippets, the memo lesson) and `scripts/app-audit <repo>`, a quick grep for the slow patterns it lists; no API change.

@@ -4,8 +4,9 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::render::Offscreen;
 
@@ -57,9 +58,19 @@ impl InFlight<wgpu::SubmissionIndex> {
     }
 }
 
+/// How a slot's `map_async` stands: asked for, answered mapped, or answered failed.
+const MAPPING: u8 = 0;
+const MAPPED: u8 = 1;
+const FAILED: u8 = 2;
+
+/// How long a frame's map may stay unanswered once the device has no work left. Its callback can
+/// be running on another thread that polled the same device (a video surface's completion worker
+/// does), so it is waited for, but a callback that never comes doesn't hang the run.
+const UNANSWERED: Duration = Duration::from_secs(5);
+
 struct Slot {
     readback: rune_staging::Readback,
-    ready: Arc<AtomicBool>,
+    map: Arc<AtomicU8>,
 }
 
 /// Staging buffers for an offscreen target, used in order. `T` tags each frame.
@@ -74,7 +85,7 @@ impl<T> Readback<T> {
     pub(crate) fn new(device: &wgpu::Device, target: &Offscreen, depth: usize) -> Self {
         let slots = (0..depth.max(1)).map(|_| Slot {
             readback: rune_staging::Readback::new(device, "readback ring", target.width, target.height, 4),
-            ready: Arc::new(AtomicBool::new(false)),
+            map: Arc::new(AtomicU8::new(MAPPING)),
         }).collect();
         Readback { slots, next: 0, pending: VecDeque::new() }
     }
@@ -102,11 +113,11 @@ impl<T> Readback<T> {
     /// Starts mapping every copied buffer whose commands were submitted.
     pub(crate) fn submitted(&mut self) {
         for (slot, _, mapping) in self.pending.iter_mut().filter(|p| !p.2) {
-            let ready = self.slots[*slot].ready.clone();
-            ready.store(false, Ordering::Release);
-            // A lost device's map fails: the frame stays unready and `pop`'s wait says why.
+            let map = self.slots[*slot].map.clone();
+            map.store(MAPPING, Ordering::Release);
+            // A lost device's map fails: the frame is answered failed and `pop` says so.
             self.slots[*slot].readback.buffer().slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                if r.is_ok() { ready.store(true, Ordering::Release); }
+                map.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release);
             });
             *mapping = true;
         }
@@ -130,21 +141,40 @@ impl<T> Readback<T> {
     fn pop(&mut self, device: &wgpu::Device, wait: bool) -> Option<(T, Vec<u8>)> {
         let &(slot, _, mapping) = self.pending.front()?;
         assert!(mapping, "Readback::submitted after submitting the copy");
-        let ready = &self.slots[slot].ready;
-        if !ready.load(Ordering::Acquire) {
+        let map = &self.slots[slot].map;
+        if map.load(Ordering::Acquire) != MAPPED {
             if !wait { return None; }
-            while !ready.load(Ordering::Acquire) {
-                match rune_gpu::health::poll(device, wgpu::PollType::wait_indefinitely()) {
-                    Err(error) => crate::tooling::args::die(&format!("{error} while a frame was read back; no image was written")),
-                    // Nothing left to wait for, and the map failed.
-                    Ok(wgpu::PollStatus::QueueEmpty) if !ready.load(Ordering::Acquire) => crate::tooling::args::die("a frame's readback failed; no image was written"),
-                    Ok(_) => {}
-                }
-            }
+            let poll = || rune_gpu::health::poll(device, wgpu::PollType::wait_indefinitely());
+            if let Err(error) = settle(map, poll, UNANSWERED) { crate::tooling::args::die(&error) }
         }
         let (slot, tag, _) = self.pending.pop_front().unwrap();
         let pixels = self.slots[slot].readback.take_mapped();
         Some((tag, pixels))
+    }
+}
+
+/// Waits until `map` is answered, calling `poll` (a wait for the device's work) meanwhile. Once
+/// `poll` says the queue is empty the callback may still be on its way from another thread that
+/// polled the device, so it is given until `unanswered` has passed. An error says why no image
+/// was written: the map failed, the poll did, or no answer came.
+fn settle<E: std::fmt::Display>(map: &AtomicU8, mut poll: impl FnMut() -> Result<wgpu::PollStatus, E>, unanswered: Duration) -> Result<(), String> {
+    let mut emptied: Option<Instant> = None;
+    loop {
+        match map.load(Ordering::Acquire) {
+            MAPPED => return Ok(()),
+            FAILED => return Err("a frame's readback failed; no image was written".to_owned()),
+            _ => {}
+        }
+        match poll() {
+            Err(error) => return Err(format!("{error} while a frame was read back; no image was written")),
+            Ok(wgpu::PollStatus::QueueEmpty) if map.load(Ordering::Acquire) == MAPPING => {
+                if emptied.get_or_insert_with(Instant::now).elapsed() >= unanswered {
+                    return Err(format!("a frame's readback was never answered in {unanswered:?} after the GPU finished; no image was written"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(_) => {}
+        }
     }
 }
 
@@ -350,6 +380,40 @@ mod tests {
         for (path, output) in [("-out.mp4", "./-out.mp4"), ("-dir/out.mov", "./-dir/out.mov"), ("dir/-out.webm", "dir/-out.webm")] {
             assert_eq!(ffmpeg_args(Path::new(path), (2, 2), 60.0).unwrap().last().unwrap(), output);
         }
+    }
+
+    #[test]
+    fn a_map_another_thread_answers_after_the_queue_empties_is_waited_for() {
+        let map = Arc::new(AtomicU8::new(MAPPING));
+        // Another thread's poll took the callback and runs it a little later.
+        let answering = map.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            answering.store(MAPPED, Ordering::Release);
+        });
+        let polls = std::cell::Cell::new(0);
+        let poll = || {
+            polls.set(polls.get() + 1);
+            Ok::<_, String>(wgpu::PollStatus::QueueEmpty)
+        };
+        assert_eq!(settle(&map, poll, Duration::from_secs(5)), Ok(()));
+        assert!(polls.get() > 1, "it polled again while the answer was on its way");
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn a_map_never_answered_fails_once_its_time_is_up_and_a_failed_one_at_once() {
+        let unanswered = AtomicU8::new(MAPPING);
+        let empty = || Ok::<_, String>(wgpu::PollStatus::QueueEmpty);
+        let started = Instant::now();
+        let error = settle(&unanswered, empty, Duration::from_millis(50)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(50) && error.contains("never answered"), "{error}");
+
+        let failed = AtomicU8::new(FAILED);
+        assert_eq!(settle(&failed, || -> Result<_, String> { panic!("a failed map needs no poll") }, Duration::from_secs(5)), Err("a frame's readback failed; no image was written".to_owned()));
+        let lost = || Err::<wgpu::PollStatus, _>("the GPU device was lost");
+        let error = settle(&AtomicU8::new(MAPPING), lost, Duration::from_secs(5)).unwrap_err();
+        assert!(error.starts_with("the GPU device was lost while a frame was read back"), "{error}");
     }
 
     #[test]
